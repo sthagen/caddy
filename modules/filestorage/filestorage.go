@@ -17,7 +17,7 @@ package filestorage
 import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/mholt/certmagic"
+	"github.com/caddyserver/certmagic"
 )
 
 func init() {
@@ -32,8 +32,8 @@ type FileStorage struct {
 // CaddyModule returns the Caddy module information.
 func (FileStorage) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "caddy.storage.file_system",
-		New:  func() caddy.Module { return new(FileStorage) },
+		ID:  "caddy.storage.file_system",
+		New: func() caddy.Module { return new(FileStorage) },
 	}
 }
 
@@ -59,5 +59,8 @@ func (s *FileStorage) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
-// Interface guard
-var _ caddy.StorageConverter = (*FileStorage)(nil)
+// Interface guards
+var (
+	_ caddy.StorageConverter = (*FileStorage)(nil)
+	_ caddyfile.Unmarshaler  = (*FileStorage)(nil)
+)

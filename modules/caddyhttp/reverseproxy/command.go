@@ -25,18 +25,16 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
-	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	caddycmd "github.com/caddyserver/caddy/v2/cmd"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
-	"github.com/mholt/certmagic"
 )
 
 func init() {
 	caddycmd.RegisterCommand(caddycmd.Command{
 		Name:  "reverse-proxy",
 		Func:  cmdReverseProxy,
-		Usage: "[--from <addr>] [--to <addr>]",
+		Usage: "[--from <addr>] [--to <addr>] [--change-host-header]",
 		Short: "A quick and production-ready reverse proxy",
 		Long: `
 A simple but production-ready reverse proxy. Useful for quick deployments,
@@ -46,11 +44,16 @@ Simply shuttles HTTP traffic from the --from address to the --to address.
 
 If the --from address has a domain name, Caddy will attempt to serve the
 proxy over HTTPS with a certificate.
+
+If --change-host-header is set, the Host header on the request will be modified
+from its original incoming value to the address of the upstream. (Otherwise, by
+default, all incoming headers are passed through unmodified.)
 `,
 		Flags: func() *flag.FlagSet {
 			fs := flag.NewFlagSet("file-server", flag.ExitOnError)
-			fs.String("from", "", "Address to receive traffic on")
-			fs.String("to", "", "Upstream address to proxy traffic to")
+			fs.String("from", "localhost:443", "Address on which to receive traffic")
+			fs.String("to", "", "Upstream address to which to to proxy traffic")
+			fs.Bool("change-host-header", false, "Set upstream Host header to address of upstream")
 			return fs
 		}(),
 	})
@@ -59,9 +62,10 @@ proxy over HTTPS with a certificate.
 func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 	from := fs.String("from")
 	to := fs.String("to")
+	changeHost := fs.Bool("change-host-header")
 
 	if from == "" {
-		from = "localhost:" + httpcaddyfile.DefaultPort
+		from = "localhost:443"
 	}
 
 	// URLs need a scheme in order to parse successfully
@@ -97,13 +101,16 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 	handler := Handler{
 		TransportRaw: caddyconfig.JSONModuleObject(ht, "protocol", "http", nil),
 		Upstreams:    UpstreamPool{{Dial: toURL.Host}},
-		Headers: &headers.Handler{
+	}
+
+	if changeHost {
+		handler.Headers = &headers.Handler{
 			Request: &headers.HeaderOps{
 				Set: http.Header{
-					"Host": []string{"{http.handlers.reverse_proxy.upstream.host}"},
+					"Host": []string{"{http.reverse_proxy.upstream.hostport}"},
 				},
 			},
-		},
+		}
 	}
 
 	route := caddyhttp.Route{
@@ -113,18 +120,16 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 	}
 	urlHost := fromURL.Hostname()
 	if urlHost != "" {
-		route.MatcherSetsRaw = []map[string]json.RawMessage{
-			map[string]json.RawMessage{
+		route.MatcherSetsRaw = []caddy.ModuleMap{
+			{
 				"host": caddyconfig.JSON(caddyhttp.MatchHost{urlHost}, nil),
 			},
 		}
 	}
 
-	listen := ":80"
+	listen := ":443"
 	if urlPort := fromURL.Port(); urlPort != "" {
 		listen = ":" + urlPort
-	} else if certmagic.HostQualifies(urlHost) {
-		listen = ":443"
 	}
 
 	server := &caddyhttp.Server{
@@ -138,7 +143,7 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 
 	cfg := &caddy.Config{
 		Admin: &caddy.AdminConfig{Disabled: true},
-		AppsRaw: map[string]json.RawMessage{
+		AppsRaw: caddy.ModuleMap{
 			"http": caddyconfig.JSON(httpApp, nil),
 		},
 	}

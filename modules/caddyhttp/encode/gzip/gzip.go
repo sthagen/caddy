@@ -16,13 +16,13 @@ package caddygzip
 
 import (
 	"compress/flate"
-	"compress/gzip" // TODO: consider using https://github.com/klauspost/compress/gzip
 	"fmt"
 	"strconv"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/encode"
+	"github.com/klauspost/compress/gzip"
 )
 
 func init() {
@@ -37,8 +37,8 @@ type Gzip struct {
 // CaddyModule returns the Caddy module information.
 func (Gzip) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.encoders.gzip",
-		New:  func() caddy.Module { return new(Gzip) },
+		ID:  "http.encoders.gzip",
+		New: func() caddy.Module { return new(Gzip) },
 	}
 }
 

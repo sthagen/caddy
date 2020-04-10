@@ -21,7 +21,6 @@ import (
 	"expvar"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
@@ -33,18 +32,48 @@ import (
 	"sync"
 	"time"
 
-	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"go.uber.org/zap"
 )
 
 // TODO: is there a way to make the admin endpoint so that it can be plugged into the HTTP app? see issue #2833
 
-// AdminConfig configures the admin endpoint.
+// AdminConfig configures Caddy's API endpoint, which is used
+// to manage Caddy while it is running.
 type AdminConfig struct {
-	Disabled      bool     `json:"disabled,omitempty"`
-	Listen        string   `json:"listen,omitempty"`
-	EnforceOrigin bool     `json:"enforce_origin,omitempty"`
-	Origins       []string `json:"origins,omitempty"`
+	// If true, the admin endpoint will be completely disabled.
+	// Note that this makes any runtime changes to the config
+	// impossible, since the interface to do so is through the
+	// admin endpoint.
+	Disabled bool `json:"disabled,omitempty"`
+
+	// The address to which the admin endpoint's listener should
+	// bind itself. Can be any single network address that can be
+	// parsed by Caddy. Default: localhost:2019
+	Listen string `json:"listen,omitempty"`
+
+	// If true, CORS headers will be emitted, and requests to the
+	// API will be rejected if their `Host` and `Origin` headers
+	// do not match the expected value(s). Use `origins` to
+	// customize which origins/hosts are allowed.If `origins` is
+	// not set, the listen address is the only value allowed by
+	// default.
+	EnforceOrigin bool `json:"enforce_origin,omitempty"`
+
+	// The list of allowed origins for API requests. Only used if
+	// `enforce_origin` is true. If not set, the listener address
+	// will be the default value. If set but empty, no origins will
+	// be allowed.
+	Origins []string `json:"origins,omitempty"`
+
+	// Options related to configuration management.
+	Config *ConfigSettings `json:"config,omitempty"`
+}
+
+// ConfigSettings configures the, uh, configuration... and
+// management thereof.
+type ConfigSettings struct {
+	// Whether to keep a copy of the active config on disk. Default is true.
+	Persist *bool `json:"persist,omitempty"`
 }
 
 // listenAddr extracts a singular listen address from ac.Listen,
@@ -84,7 +113,6 @@ func (admin AdminConfig) newAdminHandler(listenAddr string) adminHandler {
 	}
 
 	// register standard config control endpoints
-	addRoute("/load", AdminHandlerFunc(handleLoad))
 	addRoute("/"+rawConfigKey+"/", AdminHandlerFunc(handleConfig))
 	addRoute("/id/", AdminHandlerFunc(handleConfigID))
 	addRoute("/stop", AdminHandlerFunc(handleStop))
@@ -121,7 +149,7 @@ func (admin AdminConfig) allowedOrigins(listen string) []string {
 	if admin.Origins == nil {
 		uniqueOrigins[listen] = struct{}{}
 	}
-	var allowed []string
+	allowed := make([]string, 0, len(uniqueOrigins))
 	for origin := range uniqueOrigins {
 		allowed = append(allowed, origin)
 	}
@@ -261,10 +289,12 @@ func (h adminHandler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PUT, PATCH, DELETE")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Cache-Control")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
 		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, POST, PUT, PATCH, DELETE")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Cache-Control")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
 	}
 
 	// TODO: authentication & authorization, if configured
@@ -374,86 +404,6 @@ func (h adminHandler) originAllowed(origin string) bool {
 	return false
 }
 
-func handleLoad(w http.ResponseWriter, r *http.Request) error {
-	if r.Method != http.MethodPost {
-		return APIError{
-			Code: http.StatusMethodNotAllowed,
-			Err:  fmt.Errorf("method not allowed"),
-		}
-	}
-
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	defer bufPool.Put(buf)
-
-	_, err := io.Copy(buf, r.Body)
-	if err != nil {
-		return APIError{
-			Code: http.StatusBadRequest,
-			Err:  fmt.Errorf("reading request body: %v", err),
-		}
-	}
-	body := buf.Bytes()
-
-	// if the config is formatted other than Caddy's native
-	// JSON, we need to adapt it before loading it
-	if ctHeader := r.Header.Get("Content-Type"); ctHeader != "" {
-		ct, _, err := mime.ParseMediaType(ctHeader)
-		if err != nil {
-			return APIError{
-				Code: http.StatusBadRequest,
-				Err:  fmt.Errorf("invalid Content-Type: %v", err),
-			}
-		}
-		if !strings.HasSuffix(ct, "/json") {
-			slashIdx := strings.Index(ct, "/")
-			if slashIdx < 0 {
-				return APIError{
-					Code: http.StatusBadRequest,
-					Err:  fmt.Errorf("malformed Content-Type"),
-				}
-			}
-			adapterName := ct[slashIdx+1:]
-			cfgAdapter := caddyconfig.GetAdapter(adapterName)
-			if cfgAdapter == nil {
-				return APIError{
-					Code: http.StatusBadRequest,
-					Err:  fmt.Errorf("unrecognized config adapter '%s'", adapterName),
-				}
-			}
-			result, warnings, err := cfgAdapter.Adapt(body, nil)
-			if err != nil {
-				return APIError{
-					Code: http.StatusBadRequest,
-					Err:  fmt.Errorf("adapting config using %s adapter: %v", adapterName, err),
-				}
-			}
-			if len(warnings) > 0 {
-				respBody, err := json.Marshal(warnings)
-				if err != nil {
-					Log().Named("admin.api.load").Error(err.Error())
-				}
-				w.Write(respBody)
-			}
-			body = result
-		}
-	}
-
-	forceReload := r.Header.Get("Cache-Control") == "must-revalidate"
-
-	err = Load(body, forceReload)
-	if err != nil {
-		return APIError{
-			Code: http.StatusBadRequest,
-			Err:  fmt.Errorf("loading config: %v", err),
-		}
-	}
-
-	Log().Named("admin.api").Info("load complete")
-
-	return nil
-}
-
 func handleConfig(w http.ResponseWriter, r *http.Request) error {
 	switch r.Method {
 	case http.MethodGet:
@@ -540,14 +490,20 @@ func handleConfigID(w http.ResponseWriter, r *http.Request) error {
 }
 
 func handleStop(w http.ResponseWriter, r *http.Request) error {
-	defer func() {
-		Log().Named("admin.api").Info("stopping now, bye!! 👋")
-		os.Exit(0)
-	}()
 	err := handleUnload(w, r)
 	if err != nil {
 		Log().Named("admin.api").Error("unload error", zap.Error(err))
 	}
+	go func() {
+		err := stopAdminServer(adminServer)
+		var exitCode int
+		if err != nil {
+			exitCode = ExitCodeFailedQuit
+			Log().Named("admin.api").Error("failed to stop admin server gracefully", zap.Error(err))
+		}
+		Log().Named("admin.api").Info("stopping now, bye!! 👋")
+		os.Exit(exitCode)
+	}()
 	return nil
 }
 
@@ -609,6 +565,19 @@ func unsyncedConfigAccess(method, path string, body []byte, out io.Writer) error
 		return fmt.Errorf("path missing")
 	}
 
+	// A path that ends with "..." implies:
+	// 1) the part before it is an array
+	// 2) the payload is an array
+	// and means that the user wants to expand the elements
+	// in the payload array and append each one into the
+	// destination array, like so:
+	//     array = append(array, elems...)
+	// This special case is handled below.
+	ellipses := parts[len(parts)-1] == "..."
+	if ellipses {
+		parts = parts[:len(parts)-1]
+	}
+
 	var ptr interface{} = rawCfg
 
 traverseLoop:
@@ -639,7 +608,15 @@ traverseLoop:
 						return fmt.Errorf("encoding config: %v", err)
 					}
 				case http.MethodPost:
-					v[part] = append(arr, val)
+					if ellipses {
+						valArray, ok := val.([]interface{})
+						if !ok {
+							return fmt.Errorf("final element is not an array")
+						}
+						v[part] = append(arr, valArray...)
+					} else {
+						v[part] = append(arr, val)
+					}
 				case http.MethodPut:
 					// avoid creation of new slice and a second copy (see
 					// https://github.com/golang/go/wiki/SliceTricks#insert)
@@ -665,13 +642,19 @@ traverseLoop:
 						return fmt.Errorf("encoding config: %v", err)
 					}
 				case http.MethodPost:
+					// if the part is an existing list, POST appends to
+					// it, otherwise it just sets or creates the value
 					if arr, ok := v[part].([]interface{}); ok {
-						// if the part is an existing list, POST appends to it
-						// TODO: Do we ever reach this point, since we handle arrays
-						// separately above?
-						v[part] = append(arr, val)
+						if ellipses {
+							valArray, ok := val.([]interface{})
+							if !ok {
+								return fmt.Errorf("final element is not an array")
+							}
+							v[part] = append(arr, valArray...)
+						} else {
+							v[part] = append(arr, val)
+						}
 					} else {
-						// otherwise, it simply sets the value
 						v[part] = val
 					}
 				case http.MethodPut:
@@ -690,6 +673,12 @@ traverseLoop:
 					return fmt.Errorf("unrecognized method %s", method)
 				}
 			} else {
+				// if we are "PUTting" a new resource, the key(s) in its path
+				// might not exist yet; that's OK but we need to make them as
+				// we go, while we still have a pointer from the level above
+				if v[part] == nil && method == http.MethodPut {
+					v[part] = make(map[string]interface{})
+				}
 				ptr = v[part]
 			}
 
@@ -706,11 +695,29 @@ traverseLoop:
 			ptr = v[partInt]
 
 		default:
-			return fmt.Errorf("invalid path: %s", parts[:i+1])
+			return fmt.Errorf("invalid traversal path at: %s", strings.Join(parts[:i+1], "/"))
 		}
 	}
 
 	return nil
+}
+
+// RemoveMetaFields removes meta fields like "@id" from a JSON message
+// by using a simple regular expression. (An alternate way to do this
+// would be to delete them from the raw, map[string]interface{}
+// representation as they are indexed, then iterate the index we made
+// and add them back after encoding as JSON, but this is simpler.)
+func RemoveMetaFields(rawJSON []byte) []byte {
+	return idRegexp.ReplaceAllFunc(rawJSON, func(in []byte) []byte {
+		// matches with a comma on both sides (when "@id" property is
+		// not the first or last in the object) need to keep exactly
+		// one comma for correct JSON syntax
+		comma := []byte{','}
+		if bytes.HasPrefix(in, comma) && bytes.HasSuffix(in, comma) {
+			return comma
+		}
+		return []byte{}
+	})
 }
 
 // AdminHandler is like http.Handler except ServeHTTP may return an error.
@@ -769,7 +776,7 @@ var (
 // in the config. It also matches adjacent commas so that syntax
 // can be preserved no matter where in the object the field appears.
 // It supports string and most numeric values.
-var idRegexp = regexp.MustCompile(`(?m),?\s*"` + idKey + `":\s?(-?[0-9]+(\.[0-9]+)?|(?U)".*")\s*,?`)
+var idRegexp = regexp.MustCompile(`(?m),?\s*"` + idKey + `"\s*:\s*(-?[0-9]+(\.[0-9]+)?|(?U)".*")\s*,?`)
 
 const (
 	rawConfigKey = "config"

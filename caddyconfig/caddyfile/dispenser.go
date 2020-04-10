@@ -152,8 +152,10 @@ func (d *Dispenser) NextBlock(initialNestingLevel int) bool {
 		if !d.Next() {
 			return false // should be EOF error
 		}
-		if d.Val() == "}" {
+		if d.Val() == "}" && !d.nextOnSameLine() {
 			d.nesting--
+		} else if d.Val() == "{" && !d.nextOnSameLine() {
+			d.nesting++
 		}
 		return d.nesting > initialNestingLevel
 	}
@@ -247,13 +249,20 @@ func (d *Dispenser) RemainingArgs() []string {
 	return args
 }
 
-// NewFromNextTokens returns a new dispenser with a copy of
+// NewFromNextSegment returns a new dispenser with a copy of
 // the tokens from the current token until the end of the
 // "directive" whether that be to the end of the line or
 // the end of a block that starts at the end of the line;
 // in other words, until the end of the segment.
-func (d *Dispenser) NewFromNextTokens() *Dispenser {
-	tkns := []Token{d.Token()}
+func (d *Dispenser) NewFromNextSegment() *Dispenser {
+	return NewDispenser(d.NextSegment())
+}
+
+// NextSegment returns a copy of the tokens from the current
+// token until the end of the line or block that starts at
+// the end of the line.
+func (d *Dispenser) NextSegment() Segment {
+	tkns := Segment{d.Token()}
 	for d.NextArg() {
 		tkns = append(tkns, d.Token())
 	}
@@ -262,9 +271,9 @@ func (d *Dispenser) NewFromNextTokens() *Dispenser {
 		if !openedBlock {
 			// because NextBlock() consumes the initial open
 			// curly brace, we rewind here to append it, since
-			// our case is special in that we want to include
-			// all the tokens including surrounding curly braces
-			// for a new dispenser to have
+			// our case is special in that we want the new
+			// dispenser to have all the tokens including
+			// surrounding curly braces
 			d.Prev()
 			tkns = append(tkns, d.Token())
 			d.Next()
@@ -273,10 +282,14 @@ func (d *Dispenser) NewFromNextTokens() *Dispenser {
 		tkns = append(tkns, d.Token())
 	}
 	if openedBlock {
-		// include closing brace accordingly
+		// include closing brace
 		tkns = append(tkns, d.Token())
+
+		// do not consume the closing curly brace; the
+		// next iteration of the enclosing loop will
+		// call Next() and consume it
 	}
-	return NewDispenser(tkns)
+	return tkns
 }
 
 // Token returns the current token.

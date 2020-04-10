@@ -54,9 +54,12 @@ func TestMarkdown(t *testing.T) {
 			expect: "<ul>\n<li>str1</li>\n<li>str2</li>\n</ul>\n",
 		},
 	} {
-		result := string(context.Markdown(test.body))
+		result, err := context.funcMarkdown(test.body)
 		if result != test.expect {
 			t.Errorf("Test %d: expected '%s' but got '%s'", i, test.expect, result)
+		}
+		if err != nil {
+			t.Errorf("Test %d: got error: %v", i, result)
 		}
 	}
 }
@@ -180,7 +183,7 @@ func TestStripHTML(t *testing.T) {
 			expect: `<h1hi`,
 		},
 	} {
-		actual := context.StripHTML(test.input)
+		actual := context.funcStripHTML(test.input)
 		if actual != test.expect {
 			t.Errorf("Test %d: Expected %s, found %s. Input was StripHTML(%s)", i, test.expect, actual, test.input)
 		}
@@ -249,7 +252,7 @@ func TestFileListing(t *testing.T) {
 
 		// perform test
 		input := filepath.ToSlash(filepath.Join(filepath.Base(dirPath), test.inputBase))
-		actual, err := context.ListFiles(input)
+		actual, err := context.funcListFiles(input)
 		if err != nil {
 			if !test.shouldErr {
 				t.Errorf("Test %d: Expected no error, got: '%s'", i, err)

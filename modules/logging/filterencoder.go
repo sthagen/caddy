@@ -29,13 +29,27 @@ func init() {
 	caddy.RegisterModule(FilterEncoder{})
 }
 
-// FilterEncoder wraps an underlying encoder. It does
-// not do any encoding itself, but it can manipulate
-// (filter) fields before they are actually encoded.
-// A wrapped encoder is required.
+// FilterEncoder can filter (manipulate) fields on
+// log entries before they are actually encoded by
+// an underlying encoder.
 type FilterEncoder struct {
-	WrappedRaw json.RawMessage            `json:"wrap,omitempty"`
-	FieldsRaw  map[string]json.RawMessage `json:"fields,omitempty"`
+	// The underlying encoder that actually
+	// encodes the log entries. Required.
+	WrappedRaw json.RawMessage `json:"wrap,omitempty" caddy:"namespace=caddy.logging.encoders inline_key=format"`
+
+	// A map of field names to their filters. Note that this
+	// is not a module map; the keys are field names.
+	//
+	// Nested fields can be referenced by representing a
+	// layer of nesting with `>`. In other words, for an
+	// object like `{"a":{"b":0}}`, the inner field can
+	// be referenced as `a>b`.
+	//
+	// The following fields are fundamental to the log and
+	// cannot be filtered because they are added by the
+	// underlying logging library as special cases: ts,
+	// level, logger, and msg.
+	FieldsRaw map[string]json.RawMessage `json:"fields,omitempty" caddy:"namespace=caddy.logging.encoders.filter inline_key=filter"`
 
 	wrapped zapcore.Encoder
 	Fields  map[string]LogFieldFilter `json:"-"`
@@ -47,8 +61,8 @@ type FilterEncoder struct {
 // CaddyModule returns the Caddy module information.
 func (FilterEncoder) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "caddy.logging.encoders.filter",
-		New:  func() caddy.Module { return new(FilterEncoder) },
+		ID:  "caddy.logging.encoders.filter",
+		New: func() caddy.Module { return new(FilterEncoder) },
 	}
 }
 
@@ -59,28 +73,23 @@ func (fe *FilterEncoder) Provision(ctx caddy.Context) error {
 	}
 
 	// set up wrapped encoder (required)
-	val, err := ctx.LoadModuleInline("format", "caddy.logging.encoders", fe.WrappedRaw)
+	val, err := ctx.LoadModule(fe, "WrappedRaw")
 	if err != nil {
 		return fmt.Errorf("loading fallback encoder module: %v", err)
 	}
-	fe.WrappedRaw = nil // allow GC to deallocate
 	fe.wrapped = val.(zapcore.Encoder)
 
 	// set up each field filter
 	if fe.Fields == nil {
 		fe.Fields = make(map[string]LogFieldFilter)
 	}
-	for field, filterRaw := range fe.FieldsRaw {
-		if filterRaw == nil {
-			continue
-		}
-		val, err := ctx.LoadModuleInline("filter", "caddy.logging.encoders.filter", filterRaw)
-		if err != nil {
-			return fmt.Errorf("loading log filter module: %v", err)
-		}
-		fe.Fields[field] = val.(LogFieldFilter)
+	vals, err := ctx.LoadModule(fe, "FieldsRaw")
+	if err != nil {
+		return fmt.Errorf("loading log filter modules: %v", err)
 	}
-	fe.FieldsRaw = nil // allow GC to deallocate
+	for fieldName, modIface := range vals.(map[string]interface{}) {
+		fe.Fields[fieldName] = modIface.(LogFieldFilter)
+	}
 
 	return nil
 }
@@ -97,6 +106,9 @@ func (fe FilterEncoder) AddArray(key string, marshaler zapcore.ArrayMarshaler) e
 
 // AddObject is part of the zapcore.ObjectEncoder interface.
 func (fe FilterEncoder) AddObject(key string, marshaler zapcore.ObjectMarshaler) error {
+	if fe.filtered(key, marshaler) {
+		return nil
+	}
 	fe.keyPrefix += key + ">"
 	return fe.wrapped.AddObject(key, logObjectMarshalerWrapper{
 		enc:   fe,

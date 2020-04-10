@@ -15,7 +15,10 @@
 package reverseproxy
 
 import (
+	"net"
 	"net/http"
+	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -81,10 +84,129 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //         }
 //     }
 //
+// Proxy upstream addresses should be network dial addresses such
+// as `host:port`, or a URL such as `scheme://host:port`. Scheme
+// and port may be inferred from other parts of the address/URL; if
+// either are missing, defaults to HTTP.
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	// currently, all backends must use the same scheme/protocol (the
+	// underlying JSON does not yet support per-backend transports)
+	var commonScheme string
+
+	// we'll wait until the very end of parsing before
+	// validating and encoding the transport
+	var transport http.RoundTripper
+	var transportModuleName string
+
+	// TODO: the logic in this function is kind of sensitive, we need
+	// to write tests before making any more changes to it
+	upstreamDialAddress := func(upstreamAddr string) (string, error) {
+		var network, scheme, host, port string
+
+		if strings.Contains(upstreamAddr, "://") {
+			toURL, err := url.Parse(upstreamAddr)
+			if err != nil {
+				return "", d.Errf("parsing upstream URL: %v", err)
+			}
+
+			// there is currently no way to perform a URL rewrite between choosing
+			// a backend and proxying to it, so we cannot allow extra components
+			// in backend URLs
+			if toURL.Path != "" || toURL.RawQuery != "" || toURL.Fragment != "" {
+				return "", d.Err("for now, URLs for proxy upstreams only support scheme, host, and port components")
+			}
+
+			// ensure the port and scheme aren't in conflict
+			urlPort := toURL.Port()
+			if toURL.Scheme == "http" && urlPort == "443" {
+				return "", d.Err("upstream address has conflicting scheme (http://) and port (:443, the HTTPS port)")
+			}
+			if toURL.Scheme == "https" && urlPort == "80" {
+				return "", d.Err("upstream address has conflicting scheme (https://) and port (:80, the HTTP port)")
+			}
+
+			// if port is missing, attempt to infer from scheme
+			if toURL.Port() == "" {
+				var toPort string
+				switch toURL.Scheme {
+				case "", "http":
+					toPort = "80"
+				case "https":
+					toPort = "443"
+				}
+				toURL.Host = net.JoinHostPort(toURL.Hostname(), toPort)
+			}
+
+			scheme, host, port = toURL.Scheme, toURL.Hostname(), toURL.Port()
+		} else {
+			// extract network manually, since caddy.ParseNetworkAddress() will always add one
+			if idx := strings.Index(upstreamAddr, "/"); idx >= 0 {
+				network = strings.ToLower(strings.TrimSpace(upstreamAddr[:idx]))
+				upstreamAddr = upstreamAddr[idx+1:]
+			}
+			var err error
+			host, port, err = net.SplitHostPort(upstreamAddr)
+			if err != nil {
+				host = upstreamAddr
+			}
+		}
+
+		// if scheme is not set, we may be able to infer it from a known port
+		if scheme == "" {
+			if port == "80" {
+				scheme = "http"
+			} else if port == "443" {
+				scheme = "https"
+			}
+		}
+
+		// the underlying JSON does not yet support different
+		// transports (protocols or schemes) to each backend,
+		// so we remember the last one we see and compare them
+		if commonScheme != "" && scheme != commonScheme {
+			return "", d.Errf("for now, all proxy upstreams must use the same scheme (transport protocol); expecting '%s://' but got '%s://'",
+				commonScheme, scheme)
+		}
+		commonScheme = scheme
+
+		// for simplest possible config, we only need to include
+		// the network portion if the user specified one
+		if network != "" {
+			return caddy.JoinNetworkAddress(network, host, port), nil
+		}
+		return net.JoinHostPort(host, port), nil
+	}
+
+	// appendUpstream creates an upstream for address and adds
+	// it to the list. If the address starts with "srv+" it is
+	// treated as a SRV-based upstream, and any port will be
+	// dropped.
+	appendUpstream := func(address string) error {
+		isSRV := strings.HasPrefix(address, "srv+")
+		if isSRV {
+			address = strings.TrimPrefix(address, "srv+")
+		}
+		dialAddr, err := upstreamDialAddress(address)
+		if err != nil {
+			return err
+		}
+		if isSRV {
+			if host, _, err := net.SplitHostPort(dialAddr); err == nil {
+				dialAddr = host
+			}
+			h.Upstreams = append(h.Upstreams, &Upstream{LookupSRV: dialAddr})
+		} else {
+			h.Upstreams = append(h.Upstreams, &Upstream{Dial: dialAddr})
+		}
+		return nil
+	}
+
 	for d.Next() {
 		for _, up := range d.RemainingArgs() {
-			h.Upstreams = append(h.Upstreams, &Upstream{Dial: up})
+			err := appendUpstream(up)
+			if err != nil {
+				return err
+			}
 		}
 
 		for d.NextBlock(0) {
@@ -95,7 +217,10 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				for _, up := range args {
-					h.Upstreams = append(h.Upstreams, &Upstream{Dial: up})
+					err := appendUpstream(up)
+					if err != nil {
+						return err
+					}
 				}
 
 			case "lb_policy":
@@ -106,21 +231,21 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Err("load balancing selection policy already specified")
 				}
 				name := d.Val()
-				mod, err := caddy.GetModule("http.handlers.reverse_proxy.selection_policies." + name)
+				mod, err := caddy.GetModule("http.reverse_proxy.selection_policies." + name)
 				if err != nil {
-					return d.Errf("getting load balancing policy module '%s': %v", mod.Name, err)
+					return d.Errf("getting load balancing policy module '%s': %v", mod, err)
 				}
 				unm, ok := mod.New().(caddyfile.Unmarshaler)
 				if !ok {
-					return d.Errf("load balancing policy module '%s' is not a Caddyfile unmarshaler", mod.Name)
+					return d.Errf("load balancing policy module '%s' is not a Caddyfile unmarshaler", mod)
 				}
-				err = unm.UnmarshalCaddyfile(d.NewFromNextTokens())
+				err = unm.UnmarshalCaddyfile(d.NewFromNextSegment())
 				if err != nil {
 					return err
 				}
 				sel, ok := unm.(Selector)
 				if !ok {
-					return d.Errf("module %s is not a Selector", mod.Name)
+					return d.Errf("module %s is not a Selector", mod)
 				}
 				if h.LoadBalancing == nil {
 					h.LoadBalancing = new(LoadBalancing)
@@ -335,11 +460,15 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
-				dur, err := time.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("bad duration value '%s': %v", d.Val(), err)
+				if fi, err := strconv.Atoi(d.Val()); err == nil {
+					h.FlushInterval = caddy.Duration(fi)
+				} else {
+					dur, err := time.ParseDuration(d.Val())
+					if err != nil {
+						return d.Errf("bad duration value '%s': %v", d.Val(), err)
+					}
+					h.FlushInterval = caddy.Duration(dur)
 				}
-				h.FlushInterval = caddy.Duration(dur)
 
 			case "header_up":
 				if h.Headers == nil {
@@ -388,28 +517,55 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if h.TransportRaw != nil {
 					return d.Err("transport already specified")
 				}
-				name := d.Val()
-				mod, err := caddy.GetModule("http.handlers.reverse_proxy.transport." + name)
+				transportModuleName = d.Val()
+				mod, err := caddy.GetModule("http.reverse_proxy.transport." + transportModuleName)
 				if err != nil {
-					return d.Errf("getting transport module '%s': %v", mod.Name, err)
+					return d.Errf("getting transport module '%s': %v", mod, err)
 				}
 				unm, ok := mod.New().(caddyfile.Unmarshaler)
 				if !ok {
-					return d.Errf("transport module '%s' is not a Caddyfile unmarshaler", mod.Name)
+					return d.Errf("transport module '%s' is not a Caddyfile unmarshaler", mod)
 				}
-				err = unm.UnmarshalCaddyfile(d.NewFromNextTokens())
+				err = unm.UnmarshalCaddyfile(d.NewFromNextSegment())
 				if err != nil {
 					return err
 				}
 				rt, ok := unm.(http.RoundTripper)
 				if !ok {
-					return d.Errf("module %s is not a RoundTripper", mod.Name)
+					return d.Errf("module %s is not a RoundTripper", mod)
 				}
-				h.TransportRaw = caddyconfig.JSONModuleObject(rt, "protocol", name, nil)
+				transport = rt
 
 			default:
 				return d.Errf("unrecognized subdirective %s", d.Val())
 			}
+		}
+	}
+
+	// if the scheme inferred from the backends' addresses is
+	// HTTPS, we will need a non-nil transport to enable TLS
+	if commonScheme == "https" && transport == nil {
+		transport = new(HTTPTransport)
+		transportModuleName = "http"
+	}
+
+	// verify transport configuration, and finally encode it
+	if transport != nil {
+		if te, ok := transport.(TLSTransport); ok {
+			if commonScheme == "https" && !te.TLSEnabled() {
+				err := te.EnableTLS(new(TLSConfig))
+				if err != nil {
+					return err
+				}
+			}
+			if commonScheme == "http" && te.TLSEnabled() {
+				return d.Errf("upstream address scheme is HTTP but transport is configured for HTTP+TLS (HTTPS)")
+			}
+		} else if commonScheme == "https" {
+			return d.Errf("upstreams are configured for HTTPS but transport module does not support TLS: %T", transport)
+		}
+		if !reflect.DeepEqual(transport, reflect.New(reflect.TypeOf(transport).Elem()).Interface()) {
+			h.TransportRaw = caddyconfig.JSONModuleObject(transport, "protocol", transportModuleName, nil)
 		}
 	}
 
@@ -425,6 +581,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 //         tls_client_auth <cert_file> <key_file>
 //         tls_insecure_skip_verify
 //         tls_timeout <duration>
+//         tls_trusted_ca_certs <cert_files...>
 //         keepalive [off|<duration>]
 //         keepalive_idle_conns <max_count>
 //     }
@@ -500,6 +657,17 @@ func (h *HTTPTransport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					h.TLS = new(TLSConfig)
 				}
 				h.TLS.HandshakeTimeout = caddy.Duration(dur)
+
+			case "tls_trusted_ca_certs":
+				args := d.RemainingArgs()
+				if len(args) == 0 {
+					return d.ArgErr()
+				}
+				if h.TLS == nil {
+					h.TLS = new(TLSConfig)
+				}
+
+				h.TLS.RootCAPEMFiles = args
 
 			case "keepalive":
 				if !d.NextArg() {

@@ -20,35 +20,59 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"path"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/mholt/certmagic"
+	"github.com/caddyserver/certmagic"
+	"go.uber.org/zap"
 )
 
-// Config represents a Caddy configuration. It is the
-// top of the module structure: all Caddy modules will
-// be loaded, starting with this struct. In order to
-// be loaded and run successfully, a Config and all its
-// modules must be JSON-encodable; i.e. when filling a
-// Config struct manually, its JSON-encodable fields
-// (the ones with JSON struct tags, usually ending with
-// "Raw" if they decode into a separate field) must be
-// set so that they can be unmarshaled and provisioned.
-// Setting the fields for the decoded values instead
-// will result in those values being overwritten at
-// unmarshaling/provisioning.
+// Config is the top (or beginning) of the Caddy configuration structure.
+// Caddy config is expressed natively as a JSON document. If you prefer
+// not to work with JSON directly, there are [many config adapters](/docs/config-adapters)
+// available that can convert various inputs into Caddy JSON.
+//
+// Many parts of this config are extensible through the use of Caddy modules.
+// Fields which have a json.RawMessage type and which appear as dots (•••) in
+// the online docs can be fulfilled by modules in a certain module
+// namespace. The docs show which modules can be used in a given place.
+//
+// Whenever a module is used, its name must be given either inline as part of
+// the module, or as the key to the module's value. The docs will make it clear
+// which to use.
+//
+// Generally, all config settings are optional, as it is Caddy convention to
+// have good, documented default values. If a parameter is required, the docs
+// should say so.
+//
+// Go programs which are directly building a Config struct value should take
+// care to populate the JSON-encodable fields of the struct (i.e. the fields
+// with `json` struct tags) if employing the module lifecycle (e.g. Provision
+// method calls).
 type Config struct {
-	Admin      *AdminConfig               `json:"admin,omitempty"`
-	Logging    *Logging                   `json:"logging,omitempty"`
-	StorageRaw json.RawMessage            `json:"storage,omitempty"`
-	AppsRaw    map[string]json.RawMessage `json:"apps,omitempty"`
+	Admin   *AdminConfig `json:"admin,omitempty"`
+	Logging *Logging     `json:"logging,omitempty"`
+
+	// StorageRaw is a storage module that defines how/where Caddy
+	// stores assets (such as TLS certificates). The default storage
+	// module is `caddy.storage.file_system` (the local file system),
+	// and the default path
+	// [depends on the OS and environment](/docs/conventions#data-directory).
+	StorageRaw json.RawMessage `json:"storage,omitempty" caddy:"namespace=caddy.storage inline_key=module"`
+
+	// AppsRaw are the apps that Caddy will load and run. The
+	// app module name is the key, and the app's config is the
+	// associated value.
+	AppsRaw ModuleMap `json:"apps,omitempty" caddy:"namespace="`
 
 	apps    map[string]App
 	storage certmagic.Storage
@@ -113,7 +137,7 @@ func changeConfig(method, path string, input []byte, forceReload bool) error {
 
 	// if nothing changed, no need to do a whole reload unless the client forces it
 	if !forceReload && bytes.Equal(rawCfgJSON, newCfg) {
-		Log().Named("admin.api.change_config").Info("config is unchanged")
+		Log().Named("admin.api").Info("config is unchanged")
 		return nil
 	}
 
@@ -126,22 +150,6 @@ func changeConfig(method, path string, input []byte, forceReload bool) error {
 			Err:  fmt.Errorf("indexing config: %v", err),
 		}
 	}
-
-	// remove any @id fields from the JSON, which would cause
-	// loading to break since the field wouldn't be recognized
-	// (an alternate way to do this would be to delete them from
-	// rawCfg as they are indexed, then iterate the index we made
-	// and add them back after encoding as JSON)
-	newCfg = idRegexp.ReplaceAllFunc(newCfg, func(in []byte) []byte {
-		// matches with a comma on both sides (when "@id" property is
-		// not the first or last in the object) need to keep exactly
-		// one comma for correct JSON syntax
-		comma := []byte{','}
-		if bytes.HasPrefix(in, comma) && bytes.HasSuffix(in, comma) {
-			return comma
-		}
-		return []byte{}
-	})
 
 	// load this new config; if it fails, we need to revert to
 	// our old representation of caddy's actual config
@@ -182,7 +190,7 @@ func readConfig(path string, out io.Writer) error {
 	return unsyncedConfigAccess(http.MethodGet, path, nil, out)
 }
 
-// indexConfigObjects recurisvely searches ptr for object fields named
+// indexConfigObjects recursively searches ptr for object fields named
 // "@id" and maps that ID value to the full configPath in the index.
 // This function is NOT safe for concurrent access; obtain a write lock
 // on currentCfgMu.
@@ -220,15 +228,19 @@ func indexConfigObjects(ptr interface{}, configPath string, index map[string]str
 	return nil
 }
 
-// unsyncedDecodeAndRun decodes cfgJSON and runs
-// it as the new config, replacing any other
-// current config. It does not update the raw
-// config state, as this is a lower-level function;
-// most callers will want to use Load instead.
-// A write lock on currentCfgMu is required!
+// unsyncedDecodeAndRun removes any meta fields (like @id tags)
+// from cfgJSON, decodes the result into a *Config, and runs
+// it as the new config, replacing any other current config.
+// It does NOT update the raw config state, as this is a
+// lower-level function; most callers will want to use Load
+// instead. A write lock on currentCfgMu is required!
 func unsyncedDecodeAndRun(cfgJSON []byte) error {
+	// remove any @id fields from the JSON, which would cause
+	// loading to break since the field wouldn't be recognized
+	strippedCfgJSON := RemoveMetaFields(cfgJSON)
+
 	var newCfg *Config
-	err := strictUnmarshalJSON(cfgJSON, &newCfg)
+	err := strictUnmarshalJSON(strippedCfgJSON, &newCfg)
 	if err != nil {
 		return err
 	}
@@ -245,6 +257,30 @@ func unsyncedDecodeAndRun(cfgJSON []byte) error {
 
 	// Stop, Cleanup each old app
 	unsyncedStop(oldCfg)
+
+	// autosave a non-nil config, if not disabled
+	if newCfg != nil &&
+		(newCfg.Admin == nil ||
+			newCfg.Admin.Config == nil ||
+			newCfg.Admin.Config.Persist == nil ||
+			*newCfg.Admin.Config.Persist) {
+		dir := filepath.Dir(ConfigAutosavePath)
+		err := os.MkdirAll(dir, 0700)
+		if err != nil {
+			Log().Error("unable to create folder for config autosave",
+				zap.String("dir", dir),
+				zap.Error(err))
+		} else {
+			err := ioutil.WriteFile(ConfigAutosavePath, cfgJSON, 0600)
+			if err == nil {
+				Log().Info("autosaved config", zap.String("file", ConfigAutosavePath))
+			} else {
+				Log().Error("unable to autosave config",
+					zap.String("file", ConfigAutosavePath),
+					zap.Error(err))
+			}
+		}
+	}
 
 	return nil
 }
@@ -274,9 +310,11 @@ func run(newCfg *Config, start bool) error {
 	var err error
 
 	// start the admin endpoint (and stop any prior one)
-	err = replaceAdmin(newCfg)
-	if err != nil {
-		return fmt.Errorf("starting caddy administration endpoint: %v", err)
+	if start {
+		err = replaceAdmin(newCfg)
+		if err != nil {
+			return fmt.Errorf("starting caddy administration endpoint: %v", err)
+		}
 	}
 
 	if newCfg == nil {
@@ -322,7 +360,7 @@ func run(newCfg *Config, start bool) error {
 	// set up global storage and make it CertMagic's default storage, too
 	err = func() error {
 		if newCfg.StorageRaw != nil {
-			val, err := ctx.LoadModuleInline("module", "caddy.storage", newCfg.StorageRaw)
+			val, err := ctx.LoadModule(newCfg, "StorageRaw")
 			if err != nil {
 				return fmt.Errorf("loading storage module: %v", err)
 			}
@@ -331,10 +369,10 @@ func run(newCfg *Config, start bool) error {
 				return fmt.Errorf("creating storage value: %v", err)
 			}
 			newCfg.storage = stor
-			newCfg.StorageRaw = nil // allow GC to deallocate
 		}
+
 		if newCfg.storage == nil {
-			newCfg.storage = &certmagic.FileStorage{Path: dataDir()}
+			newCfg.storage = DefaultStorage
 		}
 		certmagic.Default.Storage = newCfg.storage
 
@@ -344,14 +382,12 @@ func run(newCfg *Config, start bool) error {
 		return err
 	}
 
-	// Load, Provision, Validate each app and their submodules
+	// Load and Provision each app and their submodules
 	err = func() error {
-		for modName, rawMsg := range newCfg.AppsRaw {
-			val, err := ctx.LoadModule(modName, rawMsg)
-			if err != nil {
-				return fmt.Errorf("loading app module '%s': %v", modName, err)
+		for appName := range newCfg.AppsRaw {
+			if _, err := ctx.App(appName); err != nil {
+				return err
 			}
-			newCfg.apps[modName] = val.(App)
 		}
 		return nil
 	}()
@@ -447,7 +483,10 @@ func Validate(cfg *Config) error {
 	return err
 }
 
-// Duration is a JSON-string-unmarshable duration type.
+// Duration can be an integer or a string. An integer is
+// interpreted as nanoseconds. If a string, it is a Go
+// time.Duration value such as `300ms`, `1.5h`, or `2h45m`;
+// valid units are `ns`, `us`/`µs`, `ms`, `s`, `m`, and `h`.
 type Duration time.Duration
 
 // UnmarshalJSON satisfies json.Unmarshaler.
@@ -489,7 +528,7 @@ func goModule(mod *debug.Module) *debug.Module {
 		// TODO: track related Go issue: https://github.com/golang/go/issues/29228
 		// once that issue is fixed, we should just be able to use bi.Main... hopefully.
 		for _, dep := range bi.Deps {
-			if dep.Path == "github.com/caddyserver/caddy/v2" {
+			if dep.Path == ImportPath {
 				return dep
 			}
 		}
@@ -526,3 +565,6 @@ var (
 	// path, for converting /id/ paths to /config/ paths.
 	rawCfgIndex map[string]string
 )
+
+// ImportPath is the package import path for Caddy core.
+const ImportPath = "github.com/caddyserver/caddy/v2"

@@ -138,7 +138,7 @@ func (fcl *fakeCloseListener) Accept() (net.Conn, error) {
 	fcl.deadlineMu.Unlock()
 
 	if atomic.LoadInt32(&fcl.closed) == 1 {
-		// if we cancelled the Accept() by setting a deadline
+		// if we canceled the Accept() by setting a deadline
 		// on the listener, we need to make sure any callers of
 		// Accept() think the listener was actually closed;
 		// if we return the timeout error instead, callers might
@@ -254,40 +254,53 @@ type globalListener struct {
 	pc         net.PacketConn
 }
 
-// ParsedAddress contains the individual components
+// NetworkAddress contains the individual components
 // for a parsed network address of the form accepted
 // by ParseNetworkAddress(). Network should be a
 // network value accepted by Go's net package. Port
 // ranges are given by [StartPort, EndPort].
-type ParsedAddress struct {
+type NetworkAddress struct {
 	Network   string
 	Host      string
 	StartPort uint
 	EndPort   uint
 }
 
+// IsUnixNetwork returns true if na.Network is
+// unix, unixgram, or unixpacket.
+func (na NetworkAddress) IsUnixNetwork() bool {
+	return isUnixNetwork(na.Network)
+}
+
 // JoinHostPort is like net.JoinHostPort, but where the port
 // is StartPort + offset.
-func (pa ParsedAddress) JoinHostPort(offset uint) string {
-	return net.JoinHostPort(pa.Host, strconv.Itoa(int(pa.StartPort+offset)))
+func (na NetworkAddress) JoinHostPort(offset uint) string {
+	if na.IsUnixNetwork() {
+		return na.Host
+	}
+	return net.JoinHostPort(na.Host, strconv.Itoa(int(na.StartPort+offset)))
 }
 
 // PortRangeSize returns how many ports are in
 // pa's port range. Port ranges are inclusive,
 // so the size is the difference of start and
 // end ports plus one.
-func (pa ParsedAddress) PortRangeSize() uint {
-	return (pa.EndPort - pa.StartPort) + 1
+func (na NetworkAddress) PortRangeSize() uint {
+	return (na.EndPort - na.StartPort) + 1
 }
 
 // String reconstructs the address string to the form expected
 // by ParseNetworkAddress().
-func (pa ParsedAddress) String() string {
-	port := strconv.FormatUint(uint64(pa.StartPort), 10)
-	if pa.StartPort != pa.EndPort {
-		port += "-" + strconv.FormatUint(uint64(pa.EndPort), 10)
+func (na NetworkAddress) String() string {
+	port := strconv.FormatUint(uint64(na.StartPort), 10)
+	if na.StartPort != na.EndPort {
+		port += "-" + strconv.FormatUint(uint64(na.EndPort), 10)
 	}
-	return JoinNetworkAddress(pa.Network, pa.Host, port)
+	return JoinNetworkAddress(na.Network, na.Host, port)
+}
+
+func isUnixNetwork(netw string) bool {
+	return netw == "unix" || netw == "unixgram" || netw == "unixpacket"
 }
 
 // ParseNetworkAddress parses addr into its individual
@@ -298,17 +311,17 @@ func (pa ParsedAddress) String() string {
 //
 // Network addresses are distinct from URLs and do not
 // use URL syntax.
-func ParseNetworkAddress(addr string) (ParsedAddress, error) {
+func ParseNetworkAddress(addr string) (NetworkAddress, error) {
 	var host, port string
 	network, host, port, err := SplitNetworkAddress(addr)
 	if network == "" {
 		network = "tcp"
 	}
 	if err != nil {
-		return ParsedAddress{}, err
+		return NetworkAddress{}, err
 	}
-	if network == "unix" || network == "unixgram" || network == "unixpacket" {
-		return ParsedAddress{
+	if isUnixNetwork(network) {
+		return NetworkAddress{
 			Network: network,
 			Host:    host,
 		}, nil
@@ -320,19 +333,19 @@ func ParseNetworkAddress(addr string) (ParsedAddress, error) {
 	var start, end uint64
 	start, err = strconv.ParseUint(ports[0], 10, 16)
 	if err != nil {
-		return ParsedAddress{}, fmt.Errorf("invalid start port: %v", err)
+		return NetworkAddress{}, fmt.Errorf("invalid start port: %v", err)
 	}
 	end, err = strconv.ParseUint(ports[1], 10, 16)
 	if err != nil {
-		return ParsedAddress{}, fmt.Errorf("invalid end port: %v", err)
+		return NetworkAddress{}, fmt.Errorf("invalid end port: %v", err)
 	}
 	if end < start {
-		return ParsedAddress{}, fmt.Errorf("end port must not be less than start port")
+		return NetworkAddress{}, fmt.Errorf("end port must not be less than start port")
 	}
 	if (end - start) > maxPortSpan {
-		return ParsedAddress{}, fmt.Errorf("port range exceeds %d ports", maxPortSpan)
+		return NetworkAddress{}, fmt.Errorf("port range exceeds %d ports", maxPortSpan)
 	}
-	return ParsedAddress{
+	return NetworkAddress{
 		Network:   network,
 		Host:      host,
 		StartPort: uint(start),
@@ -347,7 +360,7 @@ func SplitNetworkAddress(a string) (network, host, port string, err error) {
 		network = strings.ToLower(strings.TrimSpace(a[:idx]))
 		a = a[idx+1:]
 	}
-	if network == "unix" || network == "unixgram" || network == "unixpacket" {
+	if isUnixNetwork(network) {
 		host = a
 		return
 	}
@@ -356,8 +369,9 @@ func SplitNetworkAddress(a string) (network, host, port string, err error) {
 }
 
 // JoinNetworkAddress combines network, host, and port into a single
-// address string of the form accepted by ParseNetworkAddress(). For unix sockets, the network
-// should be "unix" and the path to the socket should be given as the
+// address string of the form accepted by ParseNetworkAddress(). For
+// unix sockets, the network should be "unix" (or "unixgram" or
+// "unixpacket") and the path to the socket should be given as the
 // host parameter.
 func JoinNetworkAddress(network, host, port string) string {
 	var a string
@@ -370,6 +384,19 @@ func JoinNetworkAddress(network, host, port string) string {
 		a += net.JoinHostPort(host, port)
 	}
 	return a
+}
+
+// ListenerWrapper is a type that wraps a listener
+// so it can modify the input listener's methods.
+// Modules that implement this interface are found
+// in the caddy.listeners namespace. Usually, to
+// wrap a listener, you will define your own struct
+// type that embeds the input listener, then
+// implement your own methods that you want to wrap,
+// calling the underlying listener's methods where
+// appropriate.
+type ListenerWrapper interface {
+	WrapListener(net.Listener) net.Listener
 }
 
 var (

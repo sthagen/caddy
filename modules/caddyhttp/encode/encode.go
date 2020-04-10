@@ -21,7 +21,6 @@ package encode
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -40,9 +39,15 @@ func init() {
 
 // Encode is a middleware which can encode responses.
 type Encode struct {
-	EncodingsRaw map[string]json.RawMessage `json:"encodings,omitempty"`
-	Prefer       []string                   `json:"prefer,omitempty"`
-	MinLength    int                        `json:"minimum_length,omitempty"`
+	// Selection of compression algorithms to choose from. The best one
+	// will be chosen based on the client's Accept-Encoding header.
+	EncodingsRaw caddy.ModuleMap `json:"encodings,omitempty" caddy:"namespace=http.encoders"`
+
+	// If the client has no strong preference, choose this encoding. TODO: Not yet implemented
+	// Prefer    []string `json:"prefer,omitempty"`
+
+	// Only encode responses that are at least this many bytes long.
+	MinLength int `json:"minimum_length,omitempty"`
 
 	writerPools map[string]*sync.Pool // TODO: these pools do not get reused through config reloads...
 }
@@ -50,30 +55,26 @@ type Encode struct {
 // CaddyModule returns the Caddy module information.
 func (Encode) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.encode",
-		New:  func() caddy.Module { return new(Encode) },
+		ID:  "http.handlers.encode",
+		New: func() caddy.Module { return new(Encode) },
 	}
 }
 
 // Provision provisions enc.
 func (enc *Encode) Provision(ctx caddy.Context) error {
-	for modName, rawMsg := range enc.EncodingsRaw {
-		val, err := ctx.LoadModule("http.encoders."+modName, rawMsg)
+	mods, err := ctx.LoadModule(enc, "EncodingsRaw")
+	if err != nil {
+		return fmt.Errorf("loading encoder modules: %v", err)
+	}
+	for modName, modIface := range mods.(map[string]interface{}) {
+		err = enc.addEncoding(modIface.(Encoding))
 		if err != nil {
-			return fmt.Errorf("loading encoder module '%s': %v", modName, err)
-		}
-		encoding := val.(Encoding)
-		err = enc.addEncoding(encoding)
-		if err != nil {
-			return err
+			return fmt.Errorf("adding encoding %s: %v", modName, err)
 		}
 	}
-	enc.EncodingsRaw = nil // allow GC to deallocate
-
 	if enc.MinLength == 0 {
 		enc.MinLength = defaultMinLength
 	}
-
 	return nil
 }
 
@@ -281,7 +282,7 @@ func acceptedEncodings(r *http.Request) []string {
 		}
 
 		// encodings with q-factor of 0 are not accepted;
-		// use a small theshold to account for float precision
+		// use a small threshold to account for float precision
 		if qFactor < 0.00001 {
 			continue
 		}

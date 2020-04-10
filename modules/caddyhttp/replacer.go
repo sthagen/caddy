@@ -15,6 +15,9 @@
 package caddyhttp
 
 import (
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -24,14 +27,15 @@ import (
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
 )
 
-func addHTTPVarsToReplacer(repl caddy.Replacer, req *http.Request, w http.ResponseWriter) {
-	httpVars := func(key string) (string, bool) {
+func addHTTPVarsToReplacer(repl *caddy.Replacer, req *http.Request, w http.ResponseWriter) {
+	httpVars := func(key string) (interface{}, bool) {
 		if req != nil {
 			// query string parameters
-			if strings.HasPrefix(key, queryReplPrefix) {
-				vals := req.URL.Query()[key[len(queryReplPrefix):]]
+			if strings.HasPrefix(key, reqURIQueryReplPrefix) {
+				vals := req.URL.Query()[key[len(reqURIQueryReplPrefix):]]
 				// always return true, since the query param might
 				// be present only in some requests
 				return strings.Join(vals, ","), true
@@ -47,8 +51,8 @@ func addHTTPVarsToReplacer(repl caddy.Replacer, req *http.Request, w http.Respon
 			}
 
 			// cookies
-			if strings.HasPrefix(key, cookieReplPrefix) {
-				name := key[len(cookieReplPrefix):]
+			if strings.HasPrefix(key, reqCookieReplPrefix) {
+				name := key[len(reqCookieReplPrefix):]
 				for _, cookie := range req.Cookies() {
 					if strings.EqualFold(name, cookie.Name) {
 						// always return true, since the cookie might
@@ -56,6 +60,11 @@ func addHTTPVarsToReplacer(repl caddy.Replacer, req *http.Request, w http.Respon
 						return cookie.Value, true
 					}
 				}
+			}
+
+			// http.request.tls.*
+			if strings.HasPrefix(key, reqTLSReplPrefix) {
+				return getReqTLSReplacement(req, key)
 			}
 
 			switch key {
@@ -76,6 +85,9 @@ func addHTTPVarsToReplacer(repl caddy.Replacer, req *http.Request, w http.Respon
 				return host, true
 			case "http.request.port":
 				_, port, _ := net.SplitHostPort(req.Host)
+				if portNum, err := strconv.Atoi(port); err == nil {
+					return portNum, true
+				}
 				return port, true
 			case "http.request.hostport":
 				return req.Host, true
@@ -89,6 +101,9 @@ func addHTTPVarsToReplacer(repl caddy.Replacer, req *http.Request, w http.Respon
 				return host, true
 			case "http.request.remote.port":
 				_, port, _ := net.SplitHostPort(req.RemoteAddr)
+				if portNum, err := strconv.Atoi(port); err == nil {
+					return portNum, true
+				}
 				return port, true
 
 			// current URI, including any internal rewrites
@@ -104,12 +119,6 @@ func addHTTPVarsToReplacer(repl caddy.Replacer, req *http.Request, w http.Respon
 				return dir, true
 			case "http.request.uri.query":
 				return req.URL.RawQuery, true
-			case "http.request.uri.query_string":
-				qs := req.URL.Query().Encode()
-				if qs != "" {
-					qs = "?" + qs
-				}
-				return qs, true
 
 				// original request, before any internal changes
 			case "http.request.orig_method":
@@ -132,18 +141,11 @@ func addHTTPVarsToReplacer(repl caddy.Replacer, req *http.Request, w http.Respon
 			case "http.request.orig_uri.query":
 				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
 				return or.URL.RawQuery, true
-			case "http.request.orig_uri.query_string":
-				or, _ := req.Context().Value(OriginalRequestCtxKey).(http.Request)
-				qs := or.URL.Query().Encode()
-				if qs != "" {
-					qs = "?" + qs
-				}
-				return qs, true
 			}
 
 			// hostname labels
-			if strings.HasPrefix(key, hostLabelReplPrefix) {
-				idxStr := key[len(hostLabelReplPrefix):]
+			if strings.HasPrefix(key, reqHostLabelsReplPrefix) {
+				idxStr := key[len(reqHostLabelsReplPrefix):]
 				idx, err := strconv.Atoi(idxStr)
 				if err != nil {
 					return "", false
@@ -163,8 +165,8 @@ func addHTTPVarsToReplacer(repl caddy.Replacer, req *http.Request, w http.Respon
 			}
 
 			// path parts
-			if strings.HasPrefix(key, pathPartsReplPrefix) {
-				idxStr := key[len(pathPartsReplPrefix):]
+			if strings.HasPrefix(key, reqURIPathReplPrefix) {
+				idxStr := key[len(reqURIPathReplPrefix):]
 				idx, err := strconv.Atoi(idxStr)
 				if err != nil {
 					return "", false
@@ -186,21 +188,10 @@ func addHTTPVarsToReplacer(repl caddy.Replacer, req *http.Request, w http.Respon
 			if strings.HasPrefix(key, varsReplPrefix) {
 				varName := key[len(varsReplPrefix):]
 				tbl := req.Context().Value(VarsCtxKey).(map[string]interface{})
-				raw, ok := tbl[varName]
-				if !ok {
-					// variables can be dynamic, so always return true
-					// even when it may not be set; treat as empty
-					return "", true
-				}
-				// do our best to convert it to a string efficiently
-				switch val := raw.(type) {
-				case string:
-					return val, true
-				case fmt.Stringer:
-					return val.String(), true
-				default:
-					return fmt.Sprintf("%s", val), true
-				}
+				raw := tbl[varName]
+				// variables can be dynamic, so always return true
+				// even when it may not be set; treat as empty then
+				return raw, true
 			}
 		}
 
@@ -215,18 +206,76 @@ func addHTTPVarsToReplacer(repl caddy.Replacer, req *http.Request, w http.Respon
 			}
 		}
 
-		return "", false
+		return nil, false
 	}
 
 	repl.Map(httpVars)
 }
 
+func getReqTLSReplacement(req *http.Request, key string) (interface{}, bool) {
+	if req == nil || req.TLS == nil {
+		return nil, false
+	}
+
+	if len(key) < len(reqTLSReplPrefix) {
+		return nil, false
+	}
+
+	field := strings.ToLower(key[len(reqTLSReplPrefix):])
+
+	if strings.HasPrefix(field, "client.") {
+		cert := getTLSPeerCert(req.TLS)
+		if cert == nil {
+			return nil, false
+		}
+
+		switch field {
+		case "client.fingerprint":
+			return fmt.Sprintf("%x", sha256.Sum256(cert.Raw)), true
+		case "client.issuer":
+			return cert.Issuer, true
+		case "client.serial":
+			return cert.SerialNumber, true
+		case "client.subject":
+			return cert.Subject, true
+		default:
+			return nil, false
+		}
+	}
+
+	switch field {
+	case "version":
+		return caddytls.ProtocolName(req.TLS.Version), true
+	case "cipher_suite":
+		return tls.CipherSuiteName(req.TLS.CipherSuite), true
+	case "resumed":
+		return req.TLS.DidResume, true
+	case "proto":
+		return req.TLS.NegotiatedProtocol, true
+	case "proto_mutual":
+		return req.TLS.NegotiatedProtocolIsMutual, true
+	case "server_name":
+		return req.TLS.ServerName, true
+	}
+	return nil, false
+}
+
+// getTLSPeerCert retrieves the first peer certificate from a TLS session.
+// Returns nil if no peer cert is in use.
+func getTLSPeerCert(cs *tls.ConnectionState) *x509.Certificate {
+	if len(cs.PeerCertificates) == 0 {
+		return nil
+	}
+	return cs.PeerCertificates[0]
+}
+
 const (
-	queryReplPrefix      = "http.request.uri.query."
-	reqHeaderReplPrefix  = "http.request.header."
-	cookieReplPrefix     = "http.request.cookie."
-	hostLabelReplPrefix  = "http.request.host.labels."
-	pathPartsReplPrefix  = "http.request.uri.path."
-	varsReplPrefix       = "http.vars."
-	respHeaderReplPrefix = "http.response.header."
+	reqCookieReplPrefix     = "http.request.cookie."
+	reqHeaderReplPrefix     = "http.request.header."
+	reqHostLabelsReplPrefix = "http.request.host.labels."
+	reqTLSReplPrefix        = "http.request.tls."
+	reqURIPathReplPrefix    = "http.request.uri.path."
+	reqURIQueryReplPrefix   = "http.request.uri.query."
+	respHeaderReplPrefix    = "http.response.header."
+	varsReplPrefix          = "http.vars."
 )

@@ -36,28 +36,84 @@ func TestReplacer(t *testing.T) {
 			expect: "{",
 		},
 		{
+			input:  `\{`,
+			expect: `{`,
+		},
+		{
 			input:  "foo{",
 			expect: "foo{",
+		},
+		{
+			input:  `foo\{`,
+			expect: `foo{`,
 		},
 		{
 			input:  "foo{bar",
 			expect: "foo{bar",
 		},
 		{
+			input:  `foo\{bar`,
+			expect: `foo{bar`,
+		},
+		{
 			input:  "foo{bar}",
 			expect: "foo",
+		},
+		{
+			input:  `foo\{bar\}`,
+			expect: `foo{bar}`,
 		},
 		{
 			input:  "}",
 			expect: "}",
 		},
 		{
+			input:  `\}`,
+			expect: `\}`,
+		},
+		{
 			input:  "{}",
 			expect: "",
 		},
 		{
+			input:  `\{\}`,
+			expect: `{}`,
+		},
+		{
 			input:  `{"json": "object"}`,
 			expect: "",
+		},
+		{
+			input:  `\{"json": "object"}`,
+			expect: `{"json": "object"}`,
+		},
+		{
+			input:  `\{"json": "object"\}`,
+			expect: `{"json": "object"}`,
+		},
+		{
+			input:  `\{"json": "object{bar}"\}`,
+			expect: `{"json": "object"}`,
+		},
+		{
+			input:  `\{"json": \{"nested": "object"\}\}`,
+			expect: `{"json": {"nested": "object"}}`,
+		},
+		{
+			input:  `\{"json": \{"nested": "{bar}"\}\}`,
+			expect: `{"json": {"nested": ""}}`,
+		},
+		{
+			input:  `pre \{"json": \{"nested": "{bar}"\}\}`,
+			expect: `pre {"json": {"nested": ""}}`,
+		},
+		{
+			input:  `\{"json": \{"nested": "{bar}"\}\} post`,
+			expect: `{"json": {"nested": ""}} post`,
+		},
+		{
+			input:  `pre \{"json": \{"nested": "{bar}"\}\} post`,
+			expect: `pre {"json": {"nested": ""}} post`,
 		},
 		{
 			input:  `{{`,
@@ -66,6 +122,47 @@ func TestReplacer(t *testing.T) {
 		{
 			input:  `{{}`,
 			expect: "",
+		},
+		{
+			input:  `{"json": "object"\}`,
+			expect: "",
+		},
+		{
+			input:  `{unknown}`,
+			empty:  "-",
+			expect: "-",
+		},
+		{
+			input:  `back\slashes`,
+			expect: `back\slashes`,
+		},
+		{
+			input:  `double back\\slashes`,
+			expect: `double back\\slashes`,
+		},
+		{
+			input:  `placeholder {with \{ brace} in name`,
+			expect: `placeholder  in name`,
+		},
+		{
+			input:  `placeholder {with \} brace} in name`,
+			expect: `placeholder  in name`,
+		},
+		{
+			input:  `placeholder {with \} \} braces} in name`,
+			expect: `placeholder  in name`,
+		},
+		{
+			input:  `\{'group':'default','max_age':3600,'endpoints':[\{'url':'https://some.domain.local/a/d/g'\}],'include_subdomains':true\}`,
+			expect: `{'group':'default','max_age':3600,'endpoints':[{'url':'https://some.domain.local/a/d/g'}],'include_subdomains':true}`,
+		},
+		{
+			input:  `{}{}{}{\\\\}\\\\`,
+			expect: `{\\\}\\\\`,
+		},
+		{
+			input:  string([]byte{0x26, 0x00, 0x83, 0x7B, 0x84, 0x07, 0x5C, 0x7D, 0x84}),
+			expect: string([]byte{0x26, 0x00, 0x83, 0x7B, 0x84, 0x07, 0x7D, 0x84}),
 		},
 	} {
 		actual := rep.ReplaceAll(tc.input, tc.empty)
@@ -81,7 +178,7 @@ func TestReplacerSet(t *testing.T) {
 
 	for _, tc := range []struct {
 		variable string
-		value    string
+		value    interface{}
 	}{
 		{
 			variable: "test1",
@@ -90,6 +187,10 @@ func TestReplacerSet(t *testing.T) {
 		{
 			variable: "asdf",
 			value:    "123",
+		},
+		{
+			variable: "numbers",
+			value:    123.456,
 		},
 		{
 			variable: "äöü",
@@ -126,16 +227,16 @@ func TestReplacerSet(t *testing.T) {
 
 	// test if all keys are still there (by length)
 	length := len(rep.static)
-	if len(rep.static) != 7 {
+	if len(rep.static) != 8 {
 		t.Errorf("Expected length '%v' got '%v'", 7, length)
 	}
 }
 
 func TestReplacerReplaceKnown(t *testing.T) {
-	rep := replacer{
-		providers: []ReplacementFunc{
+	rep := Replacer{
+		providers: []ReplacerFunc{
 			// split our possible vars to two functions (to test if both functions are called)
-			func(key string) (val string, ok bool) {
+			func(key string) (val interface{}, ok bool) {
 				switch key {
 				case "test1":
 					return "val1", true
@@ -149,7 +250,7 @@ func TestReplacerReplaceKnown(t *testing.T) {
 					return "NOOO", false
 				}
 			},
-			func(key string) (val string, ok bool) {
+			func(key string) (val interface{}, ok bool) {
 				switch key {
 				case "1":
 					return "test-123", true
@@ -204,8 +305,8 @@ func TestReplacerReplaceKnown(t *testing.T) {
 }
 
 func TestReplacerDelete(t *testing.T) {
-	rep := replacer{
-		static: map[string]string{
+	rep := Replacer{
+		static: map[string]interface{}{
 			"key1": "val1",
 			"key2": "val2",
 			"key3": "val3",
@@ -239,11 +340,11 @@ func TestReplacerDelete(t *testing.T) {
 func TestReplacerMap(t *testing.T) {
 	rep := testReplacer()
 
-	for i, tc := range []ReplacementFunc{
-		func(key string) (val string, ok bool) {
+	for i, tc := range []ReplacerFunc{
+		func(key string) (val interface{}, ok bool) {
 			return "", false
 		},
-		func(key string) (val string, ok bool) {
+		func(key string) (val interface{}, ok bool) {
 			return "", false
 		},
 	} {
@@ -264,60 +365,94 @@ func TestReplacerMap(t *testing.T) {
 }
 
 func TestReplacerNew(t *testing.T) {
-	var tc = NewReplacer()
+	rep := NewReplacer()
 
-	rep, ok := tc.(*replacer)
-	if ok {
-		if len(rep.providers) != 2 {
-			t.Errorf("Expected providers length '%v' got length '%v'", 2, len(rep.providers))
-		} else {
-			// test if default global replacements are added  as the first provider
-			hostname, _ := os.Hostname()
-			os.Setenv("CADDY_REPLACER_TEST", "envtest")
-			defer os.Setenv("CADDY_REPLACER_TEST", "")
+	if len(rep.providers) != 2 {
+		t.Errorf("Expected providers length '%v' got length '%v'", 2, len(rep.providers))
+	} else {
+		// test if default global replacements are added  as the first provider
+		hostname, _ := os.Hostname()
+		os.Setenv("CADDY_REPLACER_TEST", "envtest")
+		defer os.Setenv("CADDY_REPLACER_TEST", "")
 
-			for _, tc := range []struct {
-				variable string
-				value    string
-			}{
-				{
-					variable: "system.hostname",
-					value:    hostname,
-				},
-				{
-					variable: "system.slash",
-					value:    string(filepath.Separator),
-				},
-				{
-					variable: "system.os",
-					value:    runtime.GOOS,
-				},
-				{
-					variable: "system.arch",
-					value:    runtime.GOARCH,
-				},
-				{
-					variable: "env.CADDY_REPLACER_TEST",
-					value:    "envtest",
-				},
-			} {
-				if val, ok := rep.providers[0](tc.variable); ok {
-					if val != tc.value {
-						t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
-					}
-				} else {
-					t.Errorf("Expected key '%s' to be recognized by first provider", tc.variable)
+		for _, tc := range []struct {
+			variable string
+			value    string
+		}{
+			{
+				variable: "system.hostname",
+				value:    hostname,
+			},
+			{
+				variable: "system.slash",
+				value:    string(filepath.Separator),
+			},
+			{
+				variable: "system.os",
+				value:    runtime.GOOS,
+			},
+			{
+				variable: "system.arch",
+				value:    runtime.GOARCH,
+			},
+			{
+				variable: "env.CADDY_REPLACER_TEST",
+				value:    "envtest",
+			},
+		} {
+			if val, ok := rep.providers[0](tc.variable); ok {
+				if val != tc.value {
+					t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
 				}
+			} else {
+				t.Errorf("Expected key '%s' to be recognized by first provider", tc.variable)
 			}
 		}
-	} else {
-		t.Errorf("Expected type of replacer %T got %T ", &replacer{}, tc)
 	}
 }
 
-func testReplacer() replacer {
-	return replacer{
-		providers: make([]ReplacementFunc, 0),
-		static:    make(map[string]string),
+func BenchmarkReplacer(b *testing.B) {
+	type testCase struct {
+		name, input, empty string
+	}
+
+	rep := testReplacer()
+	rep.Set("str", "a string")
+	rep.Set("int", 123.456)
+
+	for _, bm := range []testCase{
+		{
+			name:  "no placeholder",
+			input: `simple string`,
+		},
+		{
+			name:  "string replacement",
+			input: `str={str}`,
+		},
+		{
+			name:  "int replacement",
+			input: `int={int}`,
+		},
+		{
+			name:  "placeholder",
+			input: `{"json": "object"}`,
+		},
+		{
+			name:  "escaped placeholder",
+			input: `\{"json": \{"nested": "{bar}"\}\}`,
+		},
+	} {
+		b.Run(bm.name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				rep.ReplaceAll(bm.input, bm.empty)
+			}
+		})
+	}
+}
+
+func testReplacer() Replacer {
+	return Replacer{
+		providers: make([]ReplacerFunc, 0),
+		static:    make(map[string]interface{}),
 	}
 }

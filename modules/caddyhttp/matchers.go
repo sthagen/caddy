@@ -28,18 +28,51 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/caddyserver/caddy/v2/pkg/caddyscript"
-	"go.starlark.net/starlark"
 )
 
 type (
 	// MatchHost matches requests by the Host value (case-insensitive).
+	//
+	// When used in a top-level HTTP route,
+	// [qualifying domain names](/docs/automatic-https#hostname-requirements)
+	// may trigger [automatic HTTPS](/docs/automatic-https), which automatically
+	// provisions and renews certificates for you. Before doing this, you
+	// should ensure that DNS records for these domains are properly configured,
+	// especially A/AAAA pointed at your server.
+	//
+	// Automatic HTTPS can be
+	// [customized or disabled](/docs/modules/http#servers/automatic_https).
+	//
+	// Wildcards (`*`) may be used to represent exactly one label of the
+	// hostname, in accordance with RFC 1034 (because host matchers are also
+	// used for automatic HTTPS which influences TLS certificates). Thus,
+	// a host of `*` matches hosts like `localhost` or `internal` but not
+	// `example.com`. To catch all hosts, omit the host matcher entirely.
+	//
+	// The wildcard can be useful for matching all subdomains, for example:
+	// `*.example.com` matches `foo.example.com` but not `foo.bar.example.com`.
 	MatchHost []string
 
-	// MatchPath matches requests by the URI's path (case-insensitive).
+	// MatchPath matches requests by the URI's path (case-insensitive). Path
+	// matches are exact, but wildcards may be used:
+	//
+	// - At the end, for a prefix match (`/prefix/*`)
+	// - At the beginning, for a suffix match (`*.suffix`)
+	// - On both sides, for a substring match (`*/contains/*`)
+	// - In the middle, for a globular match (`/accounts/*/info`)
+	//
+	// This matcher is fast, so it does not support regular expressions or
+	// capture groups. For slower but more powerful matching, use the
+	// path_regexp matcher.
 	MatchPath []string
 
 	// MatchPathRE matches requests by a regular expression on the URI's path.
+	//
+	// Upon a match, it adds placeholders to the request: `{http.regexp.name.capture_group}`
+	// where `name` is the regular expression's name, and `capture_group` is either
+	// the named or positional capture group from the expression itself. If no name
+	// is given, then the placeholder omits the name: `{http.regexp.capture_group}`
+	// (potentially leading to collisions).
 	MatchPathRE struct{ MatchRegexp }
 
 	// MatchMethod matches requests by the method.
@@ -48,10 +81,21 @@ type (
 	// MatchQuery matches requests by URI's query string.
 	MatchQuery url.Values
 
-	// MatchHeader matches requests by header fields.
+	// MatchHeader matches requests by header fields. It performs fast,
+	// exact string comparisons of the field values. Fast prefix, suffix,
+	// and substring matches can also be done by suffixing, prefixing, or
+	// surrounding the value with the wildcard `*` character, respectively.
+	// If a list is null, the header must not exist. If the list is empty,
+	// the field must simply exist, regardless of its value.
 	MatchHeader http.Header
 
 	// MatchHeaderRE matches requests by a regular expression on header fields.
+	//
+	// Upon a match, it adds placeholders to the request: `{http.regexp.name.capture_group}`
+	// where `name` is the regular expression's name, and `capture_group` is either
+	// the named or positional capture group from the expression itself. If no name
+	// is given, then the placeholder omits the name: `{http.regexp.capture_group}`
+	// (potentially leading to collisions).
 	MatchHeaderRE map[string]*MatchRegexp
 
 	// MatchProtocol matches requests by protocol.
@@ -64,18 +108,30 @@ type (
 		cidrs []*net.IPNet
 	}
 
-	// MatchNegate matches requests by negating its matchers' results.
-	MatchNegate struct {
-		MatchersRaw map[string]json.RawMessage `json:"-"`
-
-		Matchers MatcherSet `json:"-"`
+	// MatchNot matches requests by negating the results of its matcher
+	// sets. A single "not" matcher takes one or more matcher sets. Each
+	// matcher set is OR'ed; in other words, if any matcher set returns
+	// true, the final result of the "not" matcher is false. Individual
+	// matchers within a set work the same (i.e. different matchers in
+	// the same set are AND'ed).
+	//
+	// Note that the generated docs which describe the structure of
+	// this module are wrong because of how this type unmarshals JSON
+	// in a custom way. The correct structure is:
+	//
+	// ```json
+	// [
+	// 	{},
+	// 	{}
+	// ]
+	// ```
+	//
+	// where each of the array elements is a matcher set, i.e. an
+	// object keyed by matcher name.
+	MatchNot struct {
+		MatcherSetsRaw []caddy.ModuleMap `json:"-" caddy:"namespace=http.matchers"`
+		MatcherSets    []MatcherSet      `json:"-"`
 	}
-
-	// MatchStarlarkExpr matches requests by evaluating a Starlark expression.
-	MatchStarlarkExpr string
-
-	// MatchTable matches requests by values in the table.
-	MatchTable string // TODO: finish implementing
 )
 
 func init() {
@@ -88,21 +144,25 @@ func init() {
 	caddy.RegisterModule(MatchHeaderRE{})
 	caddy.RegisterModule(new(MatchProtocol))
 	caddy.RegisterModule(MatchRemoteIP{})
-	caddy.RegisterModule(MatchNegate{})
-	caddy.RegisterModule(new(MatchStarlarkExpr))
+	caddy.RegisterModule(MatchNot{})
 }
 
 // CaddyModule returns the Caddy module information.
 func (MatchHost) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.matchers.host",
-		New:  func() caddy.Module { return new(MatchHost) },
+		ID:  "http.matchers.host",
+		New: func() caddy.Module { return new(MatchHost) },
 	}
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (m *MatchHost) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	*m = d.RemainingArgs()
+	for d.Next() {
+		*m = append(*m, d.RemainingArgs()...)
+		if d.NextBlock(0) {
+			return d.Err("malformed host matcher: blocks are not supported")
+		}
+	}
 	return nil
 }
 
@@ -118,7 +178,7 @@ func (m MatchHost) Match(r *http.Request) bool {
 		reqHost = strings.TrimSuffix(reqHost, "]")
 	}
 
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(caddy.Replacer)
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 outer:
 	for _, host := range m {
@@ -149,8 +209,8 @@ outer:
 // CaddyModule returns the Caddy module information.
 func (MatchPath) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.matchers.path",
-		New:  func() caddy.Module { return new(MatchPath) },
+		ID:  "http.matchers.path",
+		New: func() caddy.Module { return new(MatchPath) },
 	}
 }
 
@@ -165,11 +225,31 @@ func (m MatchPath) Provision(_ caddy.Context) error {
 // Match returns true if r matches m.
 func (m MatchPath) Match(r *http.Request) bool {
 	lowerPath := strings.ToLower(r.URL.Path)
+
+	// see #2917; Windows ignores trailing dots and spaces
+	// when accessing files (sigh), potentially causing a
+	// security risk (cry) if PHP files end up being served
+	// as static files, exposing the source code, instead of
+	// being matched by *.php to be treated as PHP scripts
+	lowerPath = strings.TrimRight(lowerPath, ". ")
+
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+
 	for _, matchPath := range m {
-		// special case: first character is equals sign,
-		// treat it as an exact match
-		if strings.HasPrefix(matchPath, "=") {
-			if lowerPath == matchPath[1:] {
+		matchPath = repl.ReplaceAll(matchPath, "")
+
+		// special case: whole path is wildcard; this is unnecessary
+		// as it matches all requests, which is the same as no matcher
+		if matchPath == "*" {
+			return true
+		}
+
+		// special case: first and last characters are wildcard,
+		// treat it as a fast substring match
+		if len(matchPath) > 1 &&
+			strings.HasPrefix(matchPath, "*") &&
+			strings.HasSuffix(matchPath, "*") {
+			if strings.Contains(lowerPath, matchPath[1:len(matchPath)-1]) {
 				return true
 			}
 			continue
@@ -184,13 +264,20 @@ func (m MatchPath) Match(r *http.Request) bool {
 			continue
 		}
 
+		// special case: last character is a wildcard,
+		// treat it as a fast prefix match
+		if strings.HasSuffix(matchPath, "*") {
+			if strings.HasPrefix(lowerPath, matchPath[:len(matchPath)-1]) {
+				return true
+			}
+			continue
+		}
+
+		// for everything else, try globular matching, which also
+		// is exact matching if there are no glob/wildcard chars;
 		// can ignore error here because we can't handle it anyway
 		matches, _ := filepath.Match(matchPath, lowerPath)
 		if matches {
-			return true
-		}
-
-		if strings.HasPrefix(lowerPath, matchPath) {
 			return true
 		}
 	}
@@ -200,7 +287,10 @@ func (m MatchPath) Match(r *http.Request) bool {
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (m *MatchPath) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
-		*m = d.RemainingArgs()
+		*m = append(*m, d.RemainingArgs()...)
+		if d.NextBlock(0) {
+			return d.Err("malformed path matcher: blocks are not supported")
+		}
 	}
 	return nil
 }
@@ -208,29 +298,32 @@ func (m *MatchPath) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 // CaddyModule returns the Caddy module information.
 func (MatchPathRE) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.matchers.path_regexp",
-		New:  func() caddy.Module { return new(MatchPathRE) },
+		ID:  "http.matchers.path_regexp",
+		New: func() caddy.Module { return new(MatchPathRE) },
 	}
 }
 
 // Match returns true if r matches m.
 func (m MatchPathRE) Match(r *http.Request) bool {
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(caddy.Replacer)
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 	return m.MatchRegexp.Match(r.URL.Path, repl)
 }
 
 // CaddyModule returns the Caddy module information.
 func (MatchMethod) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.matchers.method",
-		New:  func() caddy.Module { return new(MatchMethod) },
+		ID:  "http.matchers.method",
+		New: func() caddy.Module { return new(MatchMethod) },
 	}
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (m *MatchMethod) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
-		*m = d.RemainingArgs()
+		*m = append(*m, d.RemainingArgs()...)
+		if d.NextBlock(0) {
+			return d.Err("malformed method matcher: blocks are not supported")
+		}
 	}
 	return nil
 }
@@ -248,8 +341,8 @@ func (m MatchMethod) Match(r *http.Request) bool {
 // CaddyModule returns the Caddy module information.
 func (MatchQuery) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.matchers.query",
-		New:  func() caddy.Module { return new(MatchQuery) },
+		ID:  "http.matchers.query",
+		New: func() caddy.Module { return new(MatchQuery) },
 	}
 }
 
@@ -269,6 +362,9 @@ func (m *MatchQuery) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			return d.Errf("malformed query matcher token: %s; must be in param=val format", d.Val())
 		}
 		url.Values(*m).Set(parts[0], parts[1])
+		if d.NextBlock(0) {
+			return d.Err("malformed query matcher: blocks are not supported")
+		}
 	}
 	return nil
 }
@@ -291,8 +387,8 @@ func (m MatchQuery) Match(r *http.Request) bool {
 // CaddyModule returns the Caddy module information.
 func (MatchHeader) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.matchers.header",
-		New:  func() caddy.Module { return new(MatchHeader) },
+		ID:  "http.matchers.header",
+		New: func() caddy.Module { return new(MatchHeader) },
 	}
 }
 
@@ -304,18 +400,34 @@ func (m *MatchHeader) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		var field, val string
 		if !d.Args(&field, &val) {
-			return d.Errf("expected both field and value")
+			return d.Errf("malformed header matcher: expected both field and value")
 		}
 		http.Header(*m).Set(field, val)
+		if d.NextBlock(0) {
+			return d.Err("malformed header matcher: blocks are not supported")
+		}
 	}
 	return nil
+}
+
+// Like req.Header.Get(), but that works with Host header.
+// go's http module swallows "Host" header.
+func getHeader(r *http.Request, field string) []string {
+	field = textproto.CanonicalMIMEHeaderKey(field)
+
+	if field == "Host" {
+		return []string{r.Host}
+	}
+
+	return r.Header[field]
 }
 
 // Match returns true if r matches m.
 func (m MatchHeader) Match(r *http.Request) bool {
 	for field, allowedFieldVals := range m {
-		actualFieldVals, fieldExists := r.Header[textproto.CanonicalMIMEHeaderKey(field)]
-		if allowedFieldVals != nil && len(allowedFieldVals) == 0 && fieldExists {
+		actualFieldVals := getHeader(r, field)
+
+		if allowedFieldVals != nil && len(allowedFieldVals) == 0 && actualFieldVals != nil {
 			// a non-nil but empty list of allowed values means
 			// match if the header field exists at all
 			continue
@@ -325,6 +437,8 @@ func (m MatchHeader) Match(r *http.Request) bool {
 		for _, actualFieldVal := range actualFieldVals {
 			for _, allowedFieldVal := range allowedFieldVals {
 				switch {
+				case allowedFieldVal == "*":
+					match = true
 				case strings.HasPrefix(allowedFieldVal, "*") && strings.HasSuffix(allowedFieldVal, "*"):
 					match = strings.Contains(actualFieldVal, allowedFieldVal[1:len(allowedFieldVal)-1])
 				case strings.HasPrefix(allowedFieldVal, "*"):
@@ -349,8 +463,8 @@ func (m MatchHeader) Match(r *http.Request) bool {
 // CaddyModule returns the Caddy module information.
 func (MatchHeaderRE) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.matchers.header_regexp",
-		New:  func() caddy.Module { return new(MatchHeaderRE) },
+		ID:  "http.matchers.header_regexp",
+		New: func() caddy.Module { return new(MatchHeaderRE) },
 	}
 }
 
@@ -360,11 +474,26 @@ func (m *MatchHeaderRE) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		*m = make(map[string]*MatchRegexp)
 	}
 	for d.Next() {
-		var field, val string
-		if !d.Args(&field, &val) {
+		var first, second, third string
+		if !d.Args(&first, &second) {
 			return d.ArgErr()
 		}
-		(*m)[field] = &MatchRegexp{Pattern: val}
+
+		var name, field, val string
+		if d.Args(&third) {
+			name = first
+			field = second
+			val = third
+		} else {
+			field = first
+			val = second
+		}
+
+		(*m)[field] = &MatchRegexp{Pattern: val, Name: name}
+
+		if d.NextBlock(0) {
+			return d.Err("malformed header_regexp matcher: blocks are not supported")
+		}
 	}
 	return nil
 }
@@ -372,8 +501,17 @@ func (m *MatchHeaderRE) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 // Match returns true if r matches m.
 func (m MatchHeaderRE) Match(r *http.Request) bool {
 	for field, rm := range m {
-		repl := r.Context().Value(caddy.ReplacerCtxKey).(caddy.Replacer)
-		match := rm.Match(r.Header.Get(field), repl)
+		actualFieldVals := getHeader(r, field)
+
+		match := false
+	fieldVal:
+		for _, actualFieldVal := range actualFieldVals {
+			repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+			if rm.Match(actualFieldVal, repl) {
+				match = true
+				break fieldVal
+			}
+		}
 		if !match {
 			return false
 		}
@@ -406,8 +544,8 @@ func (m MatchHeaderRE) Validate() error {
 // CaddyModule returns the Caddy module information.
 func (MatchProtocol) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.matchers.protocol",
-		New:  func() caddy.Module { return new(MatchProtocol) },
+		ID:  "http.matchers.protocol",
+		New: func() caddy.Module { return new(MatchProtocol) },
 	}
 }
 
@@ -437,33 +575,24 @@ func (m *MatchProtocol) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 }
 
 // CaddyModule returns the Caddy module information.
-func (MatchNegate) CaddyModule() caddy.ModuleInfo {
+func (MatchNot) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.matchers.not",
-		New:  func() caddy.Module { return new(MatchNegate) },
+		ID:  "http.matchers.not",
+		New: func() caddy.Module { return new(MatchNot) },
 	}
 }
 
-// UnmarshalJSON unmarshals data into m's unexported map field.
-// This is done because we cannot embed the map directly into
-// the struct, but we need a struct because we need another
-// field just for the provisioned modules.
-func (m *MatchNegate) UnmarshalJSON(data []byte) error {
-	return json.Unmarshal(data, &m.MatchersRaw)
-}
-
-// MarshalJSON marshals m's matchers.
-func (m MatchNegate) MarshalJSON() ([]byte, error) {
-	return json.Marshal(m.MatchersRaw)
-}
-
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
-func (m *MatchNegate) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+func (m *MatchNot) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	// first, unmarshal each matcher in the set from its tokens
-
-	matcherMap := make(map[string]RequestMatcher)
+	type matcherPair struct {
+		raw     caddy.ModuleMap
+		decoded MatcherSet
+	}
 	for d.Next() {
-		for d.NextBlock(0) {
+		var mp matcherPair
+		matcherMap := make(map[string]RequestMatcher)
+		for d.NextArg() || d.NextBlock(0) {
 			matcherName := d.Val()
 			mod, err := caddy.GetModule("http.matchers." + matcherName)
 			if err != nil {
@@ -473,62 +602,86 @@ func (m *MatchNegate) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if !ok {
 				return d.Errf("matcher module '%s' is not a Caddyfile unmarshaler", matcherName)
 			}
-			err = unm.UnmarshalCaddyfile(d.NewFromNextTokens())
+			err = unm.UnmarshalCaddyfile(d.NewFromNextSegment())
 			if err != nil {
 				return err
 			}
 			rm := unm.(RequestMatcher)
-			m.Matchers = append(m.Matchers, rm)
 			matcherMap[matcherName] = rm
+			mp.decoded = append(mp.decoded, rm)
 		}
-	}
 
-	// we should now be functional, but we also need
-	// to be able to marshal as JSON, otherwise config
-	// adaptation won't work properly
-	m.MatchersRaw = make(map[string]json.RawMessage)
-	for name, matchers := range matcherMap {
-		jsonBytes, err := json.Marshal(matchers)
-		if err != nil {
-			return fmt.Errorf("marshaling matcher %s: %v", name, err)
+		// we should now have a functional 'not' matcher, but we also
+		// need to be able to marshal as JSON, otherwise config
+		// adaptation will be missing the matchers!
+		mp.raw = make(caddy.ModuleMap)
+		for name, matcher := range matcherMap {
+			jsonBytes, err := json.Marshal(matcher)
+			if err != nil {
+				return fmt.Errorf("marshaling %T matcher: %v", matcher, err)
+			}
+			mp.raw[name] = jsonBytes
 		}
-		m.MatchersRaw[name] = jsonBytes
+		m.MatcherSetsRaw = append(m.MatcherSetsRaw, mp.raw)
 	}
-
 	return nil
+}
+
+// UnmarshalJSON satisfies json.Unmarshaler. It puts the JSON
+// bytes directly into m's MatcherSetsRaw field.
+func (m *MatchNot) UnmarshalJSON(data []byte) error {
+	return json.Unmarshal(data, &m.MatcherSetsRaw)
+}
+
+// MarshalJSON satisfies json.Marshaler by marshaling
+// m's raw matcher sets.
+func (m MatchNot) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.MatcherSetsRaw)
 }
 
 // Provision loads the matcher modules to be negated.
-func (m *MatchNegate) Provision(ctx caddy.Context) error {
-	for modName, rawMsg := range m.MatchersRaw {
-		val, err := ctx.LoadModule("http.matchers."+modName, rawMsg)
-		if err != nil {
-			return fmt.Errorf("loading matcher module '%s': %v", modName, err)
-		}
-		m.Matchers = append(m.Matchers, val.(RequestMatcher))
+func (m *MatchNot) Provision(ctx caddy.Context) error {
+	matcherSets, err := ctx.LoadModule(m, "MatcherSetsRaw")
+	if err != nil {
+		return fmt.Errorf("loading matcher sets: %v", err)
 	}
-	m.MatchersRaw = nil // allow GC to deallocate
+	for _, modMap := range matcherSets.([]map[string]interface{}) {
+		var ms MatcherSet
+		for _, modIface := range modMap {
+			ms = append(ms, modIface.(RequestMatcher))
+		}
+		m.MatcherSets = append(m.MatcherSets, ms)
+	}
 	return nil
 }
 
-// Match returns true if r matches m. Since this matcher negates the
-// embedded matchers, false is returned if any of its matchers match.
-func (m MatchNegate) Match(r *http.Request) bool {
-	return !m.Matchers.Match(r)
+// Match returns true if r matches m. Since this matcher negates
+// the embedded matchers, false is returned if any of its matcher
+// sets return true.
+func (m MatchNot) Match(r *http.Request) bool {
+	for _, ms := range m.MatcherSets {
+		if ms.Match(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // CaddyModule returns the Caddy module information.
 func (MatchRemoteIP) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.matchers.remote_ip",
-		New:  func() caddy.Module { return new(MatchRemoteIP) },
+		ID:  "http.matchers.remote_ip",
+		New: func() caddy.Module { return new(MatchRemoteIP) },
 	}
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (m *MatchRemoteIP) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
-		m.Ranges = d.RemainingArgs()
+		m.Ranges = append(m.Ranges, d.RemainingArgs()...)
+		if d.NextBlock(0) {
+			return d.Err("malformed remote_ip matcher: blocks are not supported")
+		}
 	}
 	return nil
 }
@@ -594,34 +747,27 @@ func (m MatchRemoteIP) Match(r *http.Request) bool {
 	return false
 }
 
-// CaddyModule returns the Caddy module information.
-func (MatchStarlarkExpr) CaddyModule() caddy.ModuleInfo {
-	return caddy.ModuleInfo{
-		Name: "http.matchers.starlark_expr", // TODO: Rename to 'starlark'?
-		New:  func() caddy.Module { return new(MatchStarlarkExpr) },
-	}
-}
-
-// Match returns true if r matches m.
-func (m MatchStarlarkExpr) Match(r *http.Request) bool {
-	input := string(m)
-	thread := new(starlark.Thread)
-	env := caddyscript.MatcherEnv(r)
-	val, err := starlark.Eval(thread, "", input, env)
-	if err != nil {
-		// TODO: Can we detect this in Provision or Validate instead?
-		log.Printf("caddyscript for matcher is invalid: attempting to evaluate expression `%v` error `%v`", input, err)
-		return false
-	}
-	return val.String() == "True"
-}
-
-// MatchRegexp is an embeddable type for matching
-// using regular expressions.
+// MatchRegexp is an embedable type for matching
+// using regular expressions. It adds placeholders
+// to the request's replacer.
 type MatchRegexp struct {
-	Name     string `json:"name,omitempty"`
-	Pattern  string `json:"pattern"`
+	// A unique name for this regular expression. Optional,
+	// but useful to prevent overwriting captures from other
+	// regexp matchers.
+	Name string `json:"name,omitempty"`
+
+	// The regular expression to evaluate, in RE2 syntax,
+	// which is the same general syntax used by Go, Perl,
+	// and Python. For details, see
+	// [Go's regexp package](https://golang.org/pkg/regexp/).
+	// Captures are accessible via placeholders. Unnamed
+	// capture groups are exposed as their numeric, 1-based
+	// index, while named capture groups are available by
+	// the capture group name.
+	Pattern string `json:"pattern"`
+
 	compiled *regexp.Regexp
+	phPrefix string
 }
 
 // Provision compiles the regular expression.
@@ -631,6 +777,10 @@ func (mre *MatchRegexp) Provision(caddy.Context) error {
 		return fmt.Errorf("compiling matcher regexp %s: %v", mre.Pattern, err)
 	}
 	mre.compiled = re
+	mre.phPrefix = regexpPlaceholderPrefix
+	if mre.Name != "" {
+		mre.phPrefix += "." + mre.Name
+	}
 	return nil
 }
 
@@ -645,10 +795,8 @@ func (mre *MatchRegexp) Validate() error {
 // Match returns true if input matches the compiled regular
 // expression in mre. It sets values on the replacer repl
 // associated with capture groups, using the given scope
-// (namespace). Capture groups stored to repl will take on
-// the name "http.matchers.<scope>.<mre.Name>.<N>" where
-// <N> is the name or number of the capture group.
-func (mre *MatchRegexp) Match(input string, repl caddy.Replacer) bool {
+// (namespace).
+func (mre *MatchRegexp) Match(input string, repl *caddy.Replacer) bool {
 	matches := mre.compiled.FindStringSubmatch(input)
 	if matches == nil {
 		return false
@@ -656,14 +804,14 @@ func (mre *MatchRegexp) Match(input string, repl caddy.Replacer) bool {
 
 	// save all capture groups, first by index
 	for i, match := range matches {
-		key := fmt.Sprintf("http.regexp.%s.%d", mre.Name, i)
+		key := fmt.Sprintf("%s.%d", mre.phPrefix, i)
 		repl.Set(key, match)
 	}
 
 	// then by name
 	for i, name := range mre.compiled.SubexpNames() {
 		if i != 0 && name != "" {
-			key := fmt.Sprintf("http.regexp.%s.%s", mre.Name, name)
+			key := fmt.Sprintf("%s.%s", mre.phPrefix, name)
 			repl.Set(key, matches[i])
 		}
 	}
@@ -684,12 +832,15 @@ func (mre *MatchRegexp) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		default:
 			return d.ArgErr()
 		}
+		if d.NextBlock(0) {
+			return d.Err("malformed path_regexp matcher: blocks are not supported")
+		}
 	}
 	return nil
 }
 
-// ResponseMatcher is a type which can determine if a given response
-// status code and its headers match some criteria.
+// ResponseMatcher is a type which can determine if an
+// HTTP response matches some criteria.
 type ResponseMatcher struct {
 	// If set, one of these status codes would be required.
 	// A one-digit status can be used to represent all codes
@@ -747,6 +898,8 @@ func (rm ResponseMatcher) matchHeaders(hdr http.Header) bool {
 
 var wordRE = regexp.MustCompile(`\w+`)
 
+const regexpPlaceholderPrefix = "http.regexp"
+
 // Interface guards
 var (
 	_ RequestMatcher    = (*MatchHost)(nil)
@@ -761,9 +914,8 @@ var (
 	_ RequestMatcher    = (*MatchProtocol)(nil)
 	_ RequestMatcher    = (*MatchRemoteIP)(nil)
 	_ caddy.Provisioner = (*MatchRemoteIP)(nil)
-	_ RequestMatcher    = (*MatchNegate)(nil)
-	_ caddy.Provisioner = (*MatchNegate)(nil)
-	_ RequestMatcher    = (*MatchStarlarkExpr)(nil)
+	_ RequestMatcher    = (*MatchNot)(nil)
+	_ caddy.Provisioner = (*MatchNot)(nil)
 	_ caddy.Provisioner = (*MatchRegexp)(nil)
 
 	_ caddyfile.Unmarshaler = (*MatchHost)(nil)
@@ -776,6 +928,6 @@ var (
 	_ caddyfile.Unmarshaler = (*MatchProtocol)(nil)
 	_ caddyfile.Unmarshaler = (*MatchRemoteIP)(nil)
 
-	_ json.Marshaler   = (*MatchNegate)(nil)
-	_ json.Unmarshaler = (*MatchNegate)(nil)
+	_ json.Marshaler   = (*MatchNot)(nil)
+	_ json.Unmarshaler = (*MatchNot)(nil)
 )

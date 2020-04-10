@@ -27,14 +27,15 @@ func init() {
 
 // RequestBody is a middleware for manipulating the request body.
 type RequestBody struct {
+	// The maximum number of bytes to allow reading from the body by a later handler.
 	MaxSize int64 `json:"max_size,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
 func (RequestBody) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.request_body", // TODO: better name for this?
-		New:  func() caddy.Module { return new(RequestBody) },
+		ID:  "http.handlers.request_body",
+		New: func() caddy.Module { return new(RequestBody) },
 	}
 }
 

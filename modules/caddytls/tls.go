@@ -18,27 +18,45 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
-	"github.com/go-acme/lego/v3/challenge"
-	"github.com/mholt/certmagic"
+	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
 )
 
 func init() {
 	caddy.RegisterModule(TLS{})
+	caddy.RegisterModule(AutomateLoader{})
 }
 
-// TLS represents a process-wide TLS configuration.
+// TLS provides TLS facilities including certificate
+// loading and management, client auth, and more.
 type TLS struct {
-	Certificates   map[string]json.RawMessage `json:"certificates,omitempty"`
-	Automation     *AutomationConfig          `json:"automation,omitempty"`
-	SessionTickets *SessionTicketService      `json:"session_tickets,omitempty"`
+	// Caches certificates in memory for quick use during
+	// TLS handshakes. Each key is the name of a certificate
+	// loader module. All loaded certificates get pooled
+	// into the same cache and may be used to complete TLS
+	// handshakes for the relevant server names (SNI).
+	// Certificates loaded manually (anything other than
+	// "automate") are not automatically managed and will
+	// have to be refreshed manually before they expire.
+	CertificatesRaw caddy.ModuleMap `json:"certificates,omitempty" caddy:"namespace=tls.certificates"`
+
+	// Configures the automation of certificate management.
+	Automation *AutomationConfig `json:"automation,omitempty"`
+
+	// Configures session ticket ephemeral keys (STEKs).
+	SessionTickets *SessionTicketService `json:"session_tickets,omitempty"`
 
 	certificateLoaders []CertificateLoader
+	automateNames      []string
 	certCache          *certmagic.Cache
 	ctx                caddy.Context
 	storageCleanTicker *time.Ticker
@@ -49,8 +67,8 @@ type TLS struct {
 // CaddyModule returns the Caddy module information.
 func (TLS) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "tls",
-		New:  func() caddy.Module { return new(TLS) },
+		ID:  "tls",
+		New: func() caddy.Module { return new(TLS) },
 	}
 }
 
@@ -61,8 +79,8 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 
 	// set up a new certificate cache; this (re)loads all certificates
 	cacheOpts := certmagic.CacheOptions{
-		GetConfigForCert: func(cert certmagic.Certificate) (certmagic.Config, error) {
-			return t.getConfigForName(cert.Names[0])
+		GetConfigForCert: func(cert certmagic.Certificate) (*certmagic.Config, error) {
+			return t.getConfigForName(cert.Names[0]), nil
 		},
 	}
 	if t.Automation != nil {
@@ -71,28 +89,55 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 	}
 	t.certCache = certmagic.NewCache(cacheOpts)
 
-	// automation/management policies
-	if t.Automation != nil {
-		for i, ap := range t.Automation.Policies {
-			val, err := ctx.LoadModuleInline("module", "tls.management", ap.ManagementRaw)
-			if err != nil {
-				return fmt.Errorf("loading TLS automation management module: %s", err)
+	// certificate loaders
+	val, err := ctx.LoadModule(t, "CertificatesRaw")
+	if err != nil {
+		return fmt.Errorf("loading certificate loader modules: %s", err)
+	}
+	for modName, modIface := range val.(map[string]interface{}) {
+		if modName == "automate" {
+			// special case; these will be loaded in later using our automation facilities,
+			// which we want to avoid doing during provisioning
+			if automateNames, ok := modIface.(*AutomateLoader); ok && automateNames != nil {
+				t.automateNames = []string(*automateNames)
+			} else {
+				return fmt.Errorf("loading certificates with 'automate' requires array of strings, got: %T", modIface)
 			}
-			t.Automation.Policies[i].Management = val.(ManagerMaker)
-			t.Automation.Policies[i].ManagementRaw = nil // allow GC to deallocate
+			continue
 		}
+		t.certificateLoaders = append(t.certificateLoaders, modIface.(CertificateLoader))
 	}
 
-	// certificate loaders
-	for modName, rawMsg := range t.Certificates {
-		if modName == automateKey {
-			continue // special case; these will be loaded in later
+	// automation/management policies
+	if t.Automation == nil {
+		t.Automation = new(AutomationConfig)
+	}
+	t.Automation.defaultPublicAutomationPolicy = new(AutomationPolicy)
+	err = t.Automation.defaultPublicAutomationPolicy.Provision(t)
+	if err != nil {
+		return fmt.Errorf("provisioning default public automation policy: %v", err)
+	}
+	for _, n := range t.automateNames {
+		// if any names specified by the "automate" loader do not qualify for a public
+		// certificate, we should initialize a default internal automation policy
+		// (but we don't want to do this unnecessarily, since it may prompt for password!)
+		if certmagic.SubjectQualifiesForPublicCert(n) {
+			continue
 		}
-		val, err := ctx.LoadModule("tls.certificates."+modName, rawMsg)
+		t.Automation.defaultInternalAutomationPolicy = &AutomationPolicy{
+			IssuerRaw: json.RawMessage(`{"module":"internal"}`),
+		}
+		err = t.Automation.defaultInternalAutomationPolicy.Provision(t)
 		if err != nil {
-			return fmt.Errorf("loading certificate module '%s': %s", modName, err)
+			return fmt.Errorf("provisioning default internal automation policy: %v", err)
 		}
-		t.certificateLoaders = append(t.certificateLoaders, val.(CertificateLoader))
+		break
+	}
+	for i, ap := range t.Automation.Policies {
+		err := ap.Provision(t)
+		if err != nil {
+			return fmt.Errorf("provisioning automation policy %d: %v", i, err)
+		}
 	}
 
 	// session ticket ephemeral keys (STEK) service and provider
@@ -115,7 +160,8 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 
 	// load manual/static (unmanaged) certificates - we do this in
 	// provision so that other apps (such as http) can know which
-	// certificates have been manually loaded
+	// certificates have been manually loaded, and also so that
+	// commands like validate can be a better test
 	magic := certmagic.New(t.certCache, certmagic.Config{
 		Storage: ctx.Storage(),
 	})
@@ -132,24 +178,52 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 		}
 	}
 
+	// TODO: TEMPORARY UNTIL RELEASE CANDIDATES:
+	// MIGRATE MANAGED CERTIFICATE ASSETS TO NEW PATH
+	err = t.moveCertificates()
+	if err != nil {
+		t.logger.Error("migrating certificates", zap.Error(err))
+	}
+	// END TODO: TEMPORARY.
+
+	return nil
+}
+
+// Validate validates t's configuration.
+func (t *TLS) Validate() error {
+	if t.Automation != nil {
+		// ensure that host aren't repeated; since only the first
+		// automation policy is used, repeating a host in the lists
+		// isn't useful and is probably a mistake; same for two
+		// catch-all/default policies
+		var hasDefault bool
+		hostSet := make(map[string]int)
+		for i, ap := range t.Automation.Policies {
+			if len(ap.Subjects) == 0 {
+				if hasDefault {
+					return fmt.Errorf("automation policy %d is the second policy that acts as default/catch-all, but will never be used", i)
+				}
+				hasDefault = true
+			}
+			for _, h := range ap.Subjects {
+				if first, ok := hostSet[h]; ok {
+					return fmt.Errorf("automation policy %d: cannot apply more than one automation policy to host: %s (first match in policy %d)", i, h, first)
+				}
+				hostSet[h] = i
+			}
+		}
+	}
 	return nil
 }
 
 // Start activates the TLS module.
 func (t *TLS) Start() error {
-	// load automated (managed) certificates
-	if automatedRawMsg, ok := t.Certificates[automateKey]; ok {
-		var names []string
-		err := json.Unmarshal(automatedRawMsg, &names)
-		if err != nil {
-			return fmt.Errorf("automate: decoding names: %v", err)
-		}
-		err = t.Manage(names)
-		if err != nil {
-			return fmt.Errorf("automate: managing %v: %v", names, err)
-		}
+	// now that we are running, and all manual certificates have
+	// been loaded, time to load the automated/managed certificates
+	err := t.Manage(t.automateNames)
+	if err != nil {
+		return fmt.Errorf("automate: managing %v: %v", t.automateNames, err)
 	}
-	t.Certificates = nil // allow GC to deallocate
 
 	t.keepStorageClean()
 
@@ -186,55 +260,98 @@ func (t *TLS) Cleanup() error {
 // Manage immediately begins managing names according to the
 // matching automation policy.
 func (t *TLS) Manage(names []string) error {
+	// for a large number of names, we can be more memory-efficient
+	// by making only one certmagic.Config for all the names that
+	// use that config, rather than calling ManageAsync once for
+	// every name; so first, bin names by AutomationPolicy
+	policyToNames := make(map[*AutomationPolicy][]string)
 	for _, name := range names {
 		ap := t.getAutomationPolicyForName(name)
-		magic := certmagic.New(t.certCache, ap.makeCertMagicConfig(t.ctx))
-		var err error
-		if ap.ManageSync {
-			err = magic.ManageSync([]string{name})
-		} else {
-			err = magic.ManageAsync(t.ctx.Context, []string{name})
-		}
+		policyToNames[ap] = append(policyToNames[ap], name)
+	}
+
+	// now that names are grouped by policy, we can simply make one
+	// certmagic.Config for each (potentially large) group of names
+	// and call ManageAsync just once for the whole batch
+	for ap, names := range policyToNames {
+		err := ap.magic.ManageAsync(t.ctx.Context, names)
 		if err != nil {
-			return fmt.Errorf("automate: manage %s: %v", name, err)
+			return fmt.Errorf("automate: manage %v: %v", names, err)
 		}
 	}
+
 	return nil
 }
 
 // HandleHTTPChallenge ensures that the HTTP challenge is handled for the
-// certificate named by r.Host, if it is an HTTP challenge request.
+// certificate named by r.Host, if it is an HTTP challenge request. It
+// requires that the automation policy for r.Host has an issue of type
+// *certmagic.ACMEManager.
 func (t *TLS) HandleHTTPChallenge(w http.ResponseWriter, r *http.Request) bool {
 	if !certmagic.LooksLikeHTTPChallenge(r) {
 		return false
 	}
 	ap := t.getAutomationPolicyForName(r.Host)
-	magic := certmagic.New(t.certCache, ap.makeCertMagicConfig(t.ctx))
-	return magic.HandleHTTPChallenge(w, r)
+	if ap.magic.Issuer == nil {
+		return false
+	}
+	if am, ok := ap.magic.Issuer.(*ACMEIssuer); ok {
+		return certmagic.NewACMEManager(am.magic, am.template).HandleHTTPChallenge(w, r)
+	}
+	return false
 }
 
-func (t *TLS) getConfigForName(name string) (certmagic.Config, error) {
+// AddAutomationPolicy provisions and adds ap to the list of the app's
+// automation policies. If an existing automation policy exists that has
+// fewer hosts in its list than ap does, ap will be inserted before that
+// other policy (this helps ensure that ap will be prioritized/chosen
+// over, say, a catch-all policy).
+func (t *TLS) AddAutomationPolicy(ap *AutomationPolicy) error {
+	if t.Automation == nil {
+		t.Automation = new(AutomationConfig)
+	}
+	err := ap.Provision(t)
+	if err != nil {
+		return err
+	}
+	for i, other := range t.Automation.Policies {
+		// if a catch-all policy (or really, any policy with
+		// fewer names) exists, prioritize this new policy
+		if len(other.Subjects) < len(ap.Subjects) {
+			t.Automation.Policies = append(t.Automation.Policies[:i],
+				append([]*AutomationPolicy{ap}, t.Automation.Policies[i:]...)...)
+			return nil
+		}
+	}
+	// otherwise just append the new one
+	t.Automation.Policies = append(t.Automation.Policies, ap)
+	return nil
+}
+
+func (t *TLS) getConfigForName(name string) *certmagic.Config {
 	ap := t.getAutomationPolicyForName(name)
-	return ap.makeCertMagicConfig(t.ctx), nil
+	return ap.magic
 }
 
-func (t *TLS) getAutomationPolicyForName(name string) AutomationPolicy {
-	if t.Automation != nil {
-		for _, ap := range t.Automation.Policies {
-			if len(ap.Hosts) == 0 {
-				// no host filter is an automatic match
+// getAutomationPolicyForName returns the first matching automation policy
+// for the given subject name. If no matching policy can be found, the
+// default policy is used, depending on whether the name qualifies for a
+// public certificate or not.
+func (t *TLS) getAutomationPolicyForName(name string) *AutomationPolicy {
+	for _, ap := range t.Automation.Policies {
+		if len(ap.Subjects) == 0 {
+			return ap // no host filter is an automatic match
+		}
+		for _, h := range ap.Subjects {
+			if certmagic.MatchWildcard(name, h) {
 				return ap
-			}
-			for _, h := range ap.Hosts {
-				if h == name {
-					return ap
-				}
 			}
 		}
 	}
-
-	// default automation policy
-	return AutomationPolicy{Management: new(ACMEManagerMaker)}
+	if certmagic.SubjectQualifiesForPublicCert(name) || t.Automation.defaultInternalAutomationPolicy == nil {
+		return t.Automation.defaultPublicAutomationPolicy
+	}
+	return t.Automation.defaultInternalAutomationPolicy
 }
 
 // AllMatchingCertificates returns the list of all certificates in
@@ -282,10 +399,8 @@ func (t *TLS) cleanStorageUnits() {
 	// then clean each storage defined in ACME automation policies
 	if t.Automation != nil {
 		for _, ap := range t.Automation.Policies {
-			if acmeMgmt, ok := ap.Management.(ACMEManagerMaker); ok {
-				if acmeMgmt.storage != nil {
-					certmagic.CleanStorage(acmeMgmt.storage, options)
-				}
+			if ap.storage != nil {
+				certmagic.CleanStorage(ap.storage, options)
 			}
 		}
 	}
@@ -308,90 +423,20 @@ type Certificate struct {
 	Tags []string
 }
 
-// AutomationConfig designates configuration for the
-// construction and use of ACME clients.
-type AutomationConfig struct {
-	Policies           []AutomationPolicy `json:"policies,omitempty"`
-	OnDemand           *OnDemandConfig    `json:"on_demand,omitempty"`
-	OCSPCheckInterval  caddy.Duration     `json:"ocsp_interval,omitempty"`
-	RenewCheckInterval caddy.Duration     `json:"renew_interval,omitempty"`
-}
+// AutomateLoader is a no-op certificate loader module
+// that is treated as a special case: it uses this app's
+// automation features to load certificates for the
+// list of hostnames, rather than loading certificates
+// manually.
+type AutomateLoader []string
 
-// AutomationPolicy designates the policy for automating the
-// management of managed TLS certificates.
-type AutomationPolicy struct {
-	Hosts         []string        `json:"hosts,omitempty"`
-	ManagementRaw json.RawMessage `json:"management,omitempty"`
-	ManageSync    bool            `json:"manage_sync,omitempty"`
-
-	Management ManagerMaker `json:"-"`
-}
-
-// makeCertMagicConfig converts ap into a CertMagic config. Passing onDemand
-// is necessary because the automation policy does not have convenient access
-// to the TLS app's global on-demand policies;
-func (ap AutomationPolicy) makeCertMagicConfig(ctx caddy.Context) certmagic.Config {
-	// default manager (ACME) is a special case because of how CertMagic is designed
-	// TODO: refactor certmagic so that ACME manager is not a special case by extracting
-	// its config fields out of the certmagic.Config struct, or something...
-	if acmeMgmt, ok := ap.Management.(*ACMEManagerMaker); ok {
-		return acmeMgmt.makeCertMagicConfig(ctx)
-	}
-
-	return certmagic.Config{
-		NewManager: ap.Management.NewManager,
+// CaddyModule returns the Caddy module information.
+func (AutomateLoader) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "tls.certificates.automate",
+		New: func() caddy.Module { return new(AutomateLoader) },
 	}
 }
-
-// ChallengesConfig configures the ACME challenges.
-type ChallengesConfig struct {
-	HTTP    *HTTPChallengeConfig    `json:"http,omitempty"`
-	TLSALPN *TLSALPNChallengeConfig `json:"tls-alpn,omitempty"`
-	DNSRaw  json.RawMessage         `json:"dns,omitempty"`
-
-	DNS challenge.Provider `json:"-"`
-}
-
-// HTTPChallengeConfig configures the ACME HTTP challenge.
-type HTTPChallengeConfig struct {
-	Disabled      bool `json:"disabled,omitempty"`
-	AlternatePort int  `json:"alternate_port,omitempty"`
-}
-
-// TLSALPNChallengeConfig configures the ACME TLS-ALPN challenge.
-type TLSALPNChallengeConfig struct {
-	Disabled      bool `json:"disabled,omitempty"`
-	AlternatePort int  `json:"alternate_port,omitempty"`
-}
-
-// OnDemandConfig configures on-demand TLS, for obtaining
-// needed certificates at handshake-time.
-type OnDemandConfig struct {
-	RateLimit *RateLimit `json:"rate_limit,omitempty"`
-	Ask       string     `json:"ask,omitempty"`
-}
-
-// RateLimit specifies an interval with optional burst size.
-type RateLimit struct {
-	Interval caddy.Duration `json:"interval,omitempty"`
-	Burst    int            `json:"burst,omitempty"`
-}
-
-// ManagerMaker makes a certificate manager.
-type ManagerMaker interface {
-	NewManager(interactive bool) (certmagic.Manager, error)
-}
-
-// These perpetual values are used for on-demand TLS.
-var (
-	onDemandRateLimiter = certmagic.NewRateLimiter(0, 0)
-	onDemandAskClient   = &http.Client{
-		Timeout: 10 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return fmt.Errorf("following http redirects is not allowed")
-		},
-	}
-)
 
 // Variables related to storage cleaning.
 var (
@@ -401,11 +446,130 @@ var (
 	storageCleanMu sync.Mutex
 )
 
+const automateKey = "automate"
+
 // Interface guards
 var (
 	_ caddy.App          = (*TLS)(nil)
 	_ caddy.Provisioner  = (*TLS)(nil)
+	_ caddy.Validator    = (*TLS)(nil)
 	_ caddy.CleanerUpper = (*TLS)(nil)
 )
 
-const automateKey = "automate"
+// TODO: This is temporary until the release candidates
+// (beta 16 changed the storage path for certificates),
+// after which this function can be deleted
+func (t *TLS) moveCertificates() error {
+	logger := t.logger.Named("automigrate")
+
+	baseDir := caddy.AppDataDir()
+
+	// if custom storage path was defined, use that instead
+	if fs, ok := t.ctx.Storage().(*certmagic.FileStorage); ok && fs.Path != "" {
+		baseDir = fs.Path
+	}
+
+	oldAcmeDir := filepath.Join(baseDir, "acme")
+	oldAcmeCas, err := ioutil.ReadDir(oldAcmeDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("listing used ACME CAs: %v", err)
+	}
+
+	// get list of used CAs
+	oldCANames := make([]string, 0, len(oldAcmeCas))
+	for _, fi := range oldAcmeCas {
+		if !fi.IsDir() {
+			continue
+		}
+		oldCANames = append(oldCANames, fi.Name())
+	}
+
+	for _, oldCA := range oldCANames {
+		// make new destination path
+		newCAName := oldCA
+		if strings.Contains(oldCA, "api.letsencrypt.org") &&
+			!strings.HasSuffix(oldCA, "-directory") {
+			newCAName += "-directory"
+		}
+		newBaseDir := filepath.Join(baseDir, "certificates", newCAName)
+		err := os.MkdirAll(newBaseDir, 0700)
+		if err != nil {
+			return fmt.Errorf("making new certs directory: %v", err)
+		}
+
+		// list sites in old path
+		oldAcmeSitesDir := filepath.Join(oldAcmeDir, oldCA, "sites")
+		oldAcmeSites, err := ioutil.ReadDir(oldAcmeSitesDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("listing sites: %v", err)
+		}
+
+		if len(oldAcmeSites) > 0 {
+			logger.Warn("certificate storage path has changed; attempting one-time auto-migration",
+				zap.String("old_folder", oldAcmeSitesDir),
+				zap.String("new_folder", newBaseDir),
+				zap.String("details", "https://github.com/caddyserver/caddy/issues/2955"))
+		}
+
+		// for each site, move its folder and re-encode its metadata
+		for _, siteInfo := range oldAcmeSites {
+			if !siteInfo.IsDir() {
+				continue
+			}
+
+			// move the folder
+			oldPath := filepath.Join(oldAcmeSitesDir, siteInfo.Name())
+			newPath := filepath.Join(newBaseDir, siteInfo.Name())
+			logger.Info("moving certificate assets",
+				zap.String("ca", oldCA),
+				zap.String("site", siteInfo.Name()),
+				zap.String("destination", newPath))
+			err = os.Rename(oldPath, newPath)
+			if err != nil {
+				logger.Error("failed moving site to new path; skipping",
+					zap.String("old_path", oldPath),
+					zap.String("new_path", newPath),
+					zap.Error(err))
+				continue
+			}
+
+			// re-encode metadata file
+			metaFilePath := filepath.Join(newPath, siteInfo.Name()+".json")
+			metaContents, err := ioutil.ReadFile(metaFilePath)
+			if err != nil {
+				logger.Error("could not read metadata file",
+					zap.String("filename", metaFilePath),
+					zap.Error(err))
+				continue
+			}
+			if len(metaContents) == 0 {
+				continue
+			}
+			cr := certmagic.CertificateResource{
+				SANs:       []string{siteInfo.Name()},
+				IssuerData: json.RawMessage(metaContents),
+			}
+			newMeta, err := json.MarshalIndent(cr, "", "\t")
+			if err != nil {
+				logger.Error("encoding new metadata file", zap.Error(err))
+				continue
+			}
+			err = ioutil.WriteFile(metaFilePath, newMeta, 0600)
+			if err != nil {
+				logger.Error("writing new metadata file", zap.Error(err))
+				continue
+			}
+		}
+
+		// delete now-empty old sites dir (OK if fails)
+		os.Remove(oldAcmeSitesDir)
+	}
+
+	return nil
+}

@@ -32,23 +32,32 @@ type FileLoader []CertKeyFilePair
 // CaddyModule returns the Caddy module information.
 func (FileLoader) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "tls.certificates.load_files",
-		New:  func() caddy.Module { return new(FileLoader) },
+		ID:  "tls.certificates.load_files",
+		New: func() caddy.Module { return new(FileLoader) },
 	}
 }
 
 // CertKeyFilePair pairs certificate and key file names along with their
 // encoding format so that they can be loaded from disk.
 type CertKeyFilePair struct {
-	Certificate string   `json:"certificate"`
-	Key         string   `json:"key"`
-	Format      string   `json:"format,omitempty"` // "pem" is default
-	Tags        []string `json:"tags,omitempty"`
+	// Path to the certificate (public key) file.
+	Certificate string `json:"certificate"`
+
+	// Path to the private key file.
+	Key string `json:"key"`
+
+	// The format of the cert and key. Can be "pem". Default: "pem"
+	Format string `json:"format,omitempty"`
+
+	// Arbitrary values to associate with this certificate.
+	// Can be useful when you want to select a particular
+	// certificate when there may be multiple valid candidates.
+	Tags []string `json:"tags,omitempty"`
 }
 
 // LoadCertificates returns the certificates to be loaded by fl.
 func (fl FileLoader) LoadCertificates() ([]Certificate, error) {
-	var certs []Certificate
+	certs := make([]Certificate, 0, len(fl))
 	for _, pair := range fl {
 		certData, err := ioutil.ReadFile(pair.Certificate)
 		if err != nil {

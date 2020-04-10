@@ -22,17 +22,17 @@ import (
 func TestGetModules(t *testing.T) {
 	modulesMu.Lock()
 	modules = map[string]ModuleInfo{
-		"a":      {Name: "a"},
-		"a.b":    {Name: "a.b"},
-		"a.b.c":  {Name: "a.b.c"},
-		"a.b.cd": {Name: "a.b.cd"},
-		"a.c":    {Name: "a.c"},
-		"a.d":    {Name: "a.d"},
-		"b":      {Name: "b"},
-		"b.a":    {Name: "b.a"},
-		"b.b":    {Name: "b.b"},
-		"b.a.c":  {Name: "b.a.c"},
-		"c":      {Name: "c"},
+		"a":      {ID: "a"},
+		"a.b":    {ID: "a.b"},
+		"a.b.c":  {ID: "a.b.c"},
+		"a.b.cd": {ID: "a.b.cd"},
+		"a.c":    {ID: "a.c"},
+		"a.d":    {ID: "a.d"},
+		"b":      {ID: "b"},
+		"b.a":    {ID: "b.a"},
+		"b.b":    {ID: "b.b"},
+		"b.a.c":  {ID: "b.a.c"},
+		"c":      {ID: "c"},
 	}
 	modulesMu.Unlock()
 
@@ -43,24 +43,24 @@ func TestGetModules(t *testing.T) {
 		{
 			input: "",
 			expect: []ModuleInfo{
-				{Name: "a"},
-				{Name: "b"},
-				{Name: "c"},
+				{ID: "a"},
+				{ID: "b"},
+				{ID: "c"},
 			},
 		},
 		{
 			input: "a",
 			expect: []ModuleInfo{
-				{Name: "a.b"},
-				{Name: "a.c"},
-				{Name: "a.d"},
+				{ID: "a.b"},
+				{ID: "a.c"},
+				{ID: "a.d"},
 			},
 		},
 		{
 			input: "a.b",
 			expect: []ModuleInfo{
-				{Name: "a.b.c"},
-				{Name: "a.b.cd"},
+				{ID: "a.b.c"},
+				{ID: "a.b.cd"},
 			},
 		},
 		{
@@ -69,8 +69,8 @@ func TestGetModules(t *testing.T) {
 		{
 			input: "b",
 			expect: []ModuleInfo{
-				{Name: "b.a"},
-				{Name: "b.b"},
+				{ID: "b.a"},
+				{ID: "b.b"},
 			},
 		},
 		{
@@ -80,6 +80,39 @@ func TestGetModules(t *testing.T) {
 		actual := GetModules(tc.input)
 		if !reflect.DeepEqual(actual, tc.expect) {
 			t.Errorf("Test %d: Expected %v but got %v", i, tc.expect, actual)
+		}
+	}
+}
+
+func TestModuleID(t *testing.T) {
+	for i, tc := range []struct {
+		input           ModuleID
+		expectNamespace string
+		expectName      string
+	}{
+		{
+			input:           "foo",
+			expectNamespace: "",
+			expectName:      "foo",
+		},
+		{
+			input:           "foo.bar",
+			expectNamespace: "foo",
+			expectName:      "bar",
+		},
+		{
+			input:           "a.b.c",
+			expectNamespace: "a.b",
+			expectName:      "c",
+		},
+	} {
+		actualNamespace := tc.input.Namespace()
+		if actualNamespace != tc.expectNamespace {
+			t.Errorf("Test %d: Expected namespace '%s' but got '%s'", i, tc.expectNamespace, actualNamespace)
+		}
+		actualName := tc.input.Name()
+		if actualName != tc.expectName {
+			t.Errorf("Test %d: Expected name '%s' but got '%s'", i, tc.expectName, actualName)
 		}
 	}
 }

@@ -33,8 +33,8 @@ type BcryptHash struct{}
 // CaddyModule returns the Caddy module information.
 func (BcryptHash) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.authentication.hashes.bcrypt",
-		New:  func() caddy.Module { return new(BcryptHash) },
+		ID:  "http.authentication.hashes.bcrypt",
+		New: func() caddy.Module { return new(BcryptHash) },
 	}
 }
 
@@ -52,17 +52,25 @@ func (BcryptHash) Compare(hashed, plaintext, _ []byte) (bool, error) {
 
 // ScryptHash implements the scrypt KDF as a hash.
 type ScryptHash struct {
-	N         int `json:"N,omitempty"`
-	R         int `json:"r,omitempty"`
-	P         int `json:"p,omitempty"`
+	// scrypt's N parameter. If unset or 0, a safe default is used.
+	N int `json:"N,omitempty"`
+
+	// scrypt's r parameter. If unset or 0, a safe default is used.
+	R int `json:"r,omitempty"`
+
+	// scrypt's p parameter. If unset or 0, a safe default is used.
+	P int `json:"p,omitempty"`
+
+	// scrypt's key length parameter (in bytes). If unset or 0, a
+	// safe default is used.
 	KeyLength int `json:"key_length,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
 func (ScryptHash) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.authentication.hashes.scrypt",
-		New:  func() caddy.Module { return new(ScryptHash) },
+		ID:  "http.authentication.hashes.scrypt",
+		New: func() caddy.Module { return new(ScryptHash) },
 	}
 }
 

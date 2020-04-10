@@ -48,8 +48,8 @@ type RandomSelection struct{}
 // CaddyModule returns the Caddy module information.
 func (RandomSelection) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.reverse_proxy.selection_policies.random",
-		New:  func() caddy.Module { return new(RandomSelection) },
+		ID:  "http.reverse_proxy.selection_policies.random",
+		New: func() caddy.Module { return new(RandomSelection) },
 	}
 }
 
@@ -74,18 +74,30 @@ func (r RandomSelection) Select(pool UpstreamPool, request *http.Request) *Upstr
 	return randomHost
 }
 
+// UnmarshalCaddyfile sets up the module from Caddyfile tokens.
+func (r *RandomSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+	}
+	return nil
+}
+
 // RandomChoiceSelection is a policy that selects
 // two or more available hosts at random, then
 // chooses the one with the least load.
 type RandomChoiceSelection struct {
+	// The size of the sub-pool created from the larger upstream pool. The default value
+	// is 2 and the maximum at selection time is the size of the upstream pool.
 	Choose int `json:"choose,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
 func (RandomChoiceSelection) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.reverse_proxy.selection_policies.random_choose",
-		New:  func() caddy.Module { return new(RandomChoiceSelection) },
+		ID:  "http.reverse_proxy.selection_policies.random_choose",
+		New: func() caddy.Module { return new(RandomChoiceSelection) },
 	}
 }
 
@@ -154,8 +166,8 @@ type LeastConnSelection struct{}
 // CaddyModule returns the Caddy module information.
 func (LeastConnSelection) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.reverse_proxy.selection_policies.least_conn",
-		New:  func() caddy.Module { return new(LeastConnSelection) },
+		ID:  "http.reverse_proxy.selection_policies.least_conn",
+		New: func() caddy.Module { return new(LeastConnSelection) },
 	}
 }
 
@@ -190,6 +202,16 @@ func (LeastConnSelection) Select(pool UpstreamPool, _ *http.Request) *Upstream {
 	return bestHost
 }
 
+// UnmarshalCaddyfile sets up the module from Caddyfile tokens.
+func (r *LeastConnSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+	}
+	return nil
+}
+
 // RoundRobinSelection is a policy that selects
 // a host based on round-robin ordering.
 type RoundRobinSelection struct {
@@ -199,8 +221,8 @@ type RoundRobinSelection struct {
 // CaddyModule returns the Caddy module information.
 func (RoundRobinSelection) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.reverse_proxy.selection_policies.round_robin",
-		New:  func() caddy.Module { return new(RoundRobinSelection) },
+		ID:  "http.reverse_proxy.selection_policies.round_robin",
+		New: func() caddy.Module { return new(RoundRobinSelection) },
 	}
 }
 
@@ -220,6 +242,16 @@ func (r *RoundRobinSelection) Select(pool UpstreamPool, _ *http.Request) *Upstre
 	return nil
 }
 
+// UnmarshalCaddyfile sets up the module from Caddyfile tokens.
+func (r *RoundRobinSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+	}
+	return nil
+}
+
 // FirstSelection is a policy that selects
 // the first available host.
 type FirstSelection struct{}
@@ -227,8 +259,8 @@ type FirstSelection struct{}
 // CaddyModule returns the Caddy module information.
 func (FirstSelection) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.reverse_proxy.selection_policies.first",
-		New:  func() caddy.Module { return new(FirstSelection) },
+		ID:  "http.reverse_proxy.selection_policies.first",
+		New: func() caddy.Module { return new(FirstSelection) },
 	}
 }
 
@@ -242,6 +274,16 @@ func (FirstSelection) Select(pool UpstreamPool, _ *http.Request) *Upstream {
 	return nil
 }
 
+// UnmarshalCaddyfile sets up the module from Caddyfile tokens.
+func (r *FirstSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+	}
+	return nil
+}
+
 // IPHashSelection is a policy that selects a host
 // based on hashing the remote IP of the request.
 type IPHashSelection struct{}
@@ -249,8 +291,8 @@ type IPHashSelection struct{}
 // CaddyModule returns the Caddy module information.
 func (IPHashSelection) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.reverse_proxy.selection_policies.ip_hash",
-		New:  func() caddy.Module { return new(IPHashSelection) },
+		ID:  "http.reverse_proxy.selection_policies.ip_hash",
+		New: func() caddy.Module { return new(IPHashSelection) },
 	}
 }
 
@@ -263,6 +305,16 @@ func (IPHashSelection) Select(pool UpstreamPool, req *http.Request) *Upstream {
 	return hostByHashing(pool, clientIP)
 }
 
+// UnmarshalCaddyfile sets up the module from Caddyfile tokens.
+func (r *IPHashSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+	}
+	return nil
+}
+
 // URIHashSelection is a policy that selects a
 // host by hashing the request URI.
 type URIHashSelection struct{}
@@ -270,8 +322,8 @@ type URIHashSelection struct{}
 // CaddyModule returns the Caddy module information.
 func (URIHashSelection) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.reverse_proxy.selection_policies.uri_hash",
-		New:  func() caddy.Module { return new(URIHashSelection) },
+		ID:  "http.reverse_proxy.selection_policies.uri_hash",
+		New: func() caddy.Module { return new(URIHashSelection) },
 	}
 }
 
@@ -280,17 +332,28 @@ func (URIHashSelection) Select(pool UpstreamPool, req *http.Request) *Upstream {
 	return hostByHashing(pool, req.RequestURI)
 }
 
+// UnmarshalCaddyfile sets up the module from Caddyfile tokens.
+func (r *URIHashSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+	}
+	return nil
+}
+
 // HeaderHashSelection is a policy that selects
 // a host based on a given request header.
 type HeaderHashSelection struct {
+	// The HTTP header field whose value is to be hashed and used for upstream selection.
 	Field string `json:"field,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
 func (HeaderHashSelection) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.reverse_proxy.selection_policies.header",
-		New:  func() caddy.Module { return new(HeaderHashSelection) },
+		ID:  "http.reverse_proxy.selection_policies.header",
+		New: func() caddy.Module { return new(HeaderHashSelection) },
 	}
 }
 
@@ -304,6 +367,17 @@ func (s HeaderHashSelection) Select(pool UpstreamPool, req *http.Request) *Upstr
 		return RandomSelection{}.Select(pool, req)
 	}
 	return hostByHashing(pool, val)
+}
+
+// UnmarshalCaddyfile sets up the module from Caddyfile tokens.
+func (s *HeaderHashSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		if !d.NextArg() {
+			return d.ArgErr()
+		}
+		s.Field = d.Val()
+	}
+	return nil
 }
 
 // leastRequests returns the host with the

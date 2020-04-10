@@ -13,16 +13,16 @@
 // limitations under the License.
 
 // +build gofuzz
-// +build gofuzz_libfuzzer
 
 package caddyfile
 
-import (
-	"bytes"
-)
+import "bytes"
 
 func FuzzParseCaddyfile(data []byte) (score int) {
-	sb, err := Parse("Caddyfile", bytes.NewReader(data))
+	if bytes.Contains(data, []byte("import")) {
+		return -1
+	}
+	sb, err := Parse("Caddyfile", data)
 	if err != nil {
 		// if both an error is received and some ServerBlocks,
 		// then the parse was able to parse partially. Mark this

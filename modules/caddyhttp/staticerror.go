@@ -27,21 +27,31 @@ func init() {
 }
 
 // StaticError implements a simple handler that returns an error.
+// This handler returns an error value, but does not write a response.
+// This is useful when you want the server to act as if an error
+// occurred; for example, to invoke your custom error handling logic.
+//
+// Since this handler does not write a response, the error information
+// is for use by the server to know how to handle the error.
 type StaticError struct {
-	Error      string     `json:"error,omitempty"`
+	// The recommended HTTP status code. Can be either an integer or a
+	// string if placeholders are needed. Optional. Default is 500.
+	Error string `json:"error,omitempty"`
+
+	// The error message. Optional. Default is no error message.
 	StatusCode WeakString `json:"status_code,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
 func (StaticError) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.error",
-		New:  func() caddy.Module { return new(StaticError) },
+		ID:  "http.handlers.error",
+		New: func() caddy.Module { return new(StaticError) },
 	}
 }
 
 func (e StaticError) ServeHTTP(w http.ResponseWriter, r *http.Request, _ Handler) error {
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(caddy.Replacer)
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	statusCode := http.StatusInternalServerError
 	if codeStr := e.StatusCode.String(); codeStr != "" {

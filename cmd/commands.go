@@ -74,7 +74,7 @@ func init() {
 	RegisterCommand(Command{
 		Name:  "start",
 		Func:  cmdStart,
-		Usage: "[--config <path> [[--adapter <name>]]",
+		Usage: "[--config <path> [--adapter <name>]] [--watch]",
 		Short: "Starts the Caddy process in the background and then returns",
 		Long: `
 Starts the Caddy process, optionally bootstrapped with an initial config file.
@@ -87,6 +87,7 @@ using 'caddy run' instead to keep it in the foreground.`,
 			fs := flag.NewFlagSet("start", flag.ExitOnError)
 			fs.String("config", "", "Configuration file")
 			fs.String("adapter", "", "Name of config adapter to apply")
+			fs.Bool("watch", false, "Reload changed config file automatically")
 			return fs
 		}(),
 	})
@@ -94,7 +95,7 @@ using 'caddy run' instead to keep it in the foreground.`,
 	RegisterCommand(Command{
 		Name:  "run",
 		Func:  cmdRun,
-		Usage: "[--config <path> [--adapter <name>]] [--environ]",
+		Usage: "[--config <path> [--adapter <name>]] [--environ] [--watch]",
 		Short: `Starts the Caddy process and blocks indefinitely`,
 		Long: `
 Starts the Caddy process, optionally bootstrapped with an initial config file,
@@ -116,12 +117,21 @@ line flags.
 
 If --environ is specified, the environment as seen by the Caddy process will
 be printed before starting. This is the same as the environ command but does
-not quit after printing, and can be useful for troubleshooting.`,
+not quit after printing, and can be useful for troubleshooting.
+
+The --resume flag will override the --config flag if there is a config auto-
+save file. It is not an error if --resume is used and no autosave file exists.
+
+If --watch is specified, the config file will be loaded automatically after
+changes. ⚠️ This is dangerous in production! Only use this option in a local
+development environment.`,
 		Flags: func() *flag.FlagSet {
 			fs := flag.NewFlagSet("run", flag.ExitOnError)
 			fs.String("config", "", "Configuration file")
 			fs.String("adapter", "", "Name of config adapter to apply")
 			fs.Bool("environ", false, "Print environment")
+			fs.Bool("resume", false, "Use saved config, if any (and prefer over --config file)")
+			fs.Bool("watch", false, "Watch config file for changes and reload it automatically")
 			fs.String("pingback", "", "Echo confirmation bytes to this address on success")
 			return fs
 		}(),
@@ -134,13 +144,9 @@ not quit after printing, and can be useful for troubleshooting.`,
 		Long: `
 Stops the background Caddy process as gracefully as possible.
 
-It will first try to use the admin API's /stop endpoint; the address of
-this request can be customized using the --address flag if it is not the
-default.
-
-If that fails for any reason, it will attempt to signal the first process
-it can find named the same as this one (os.Args[0]). On Windows, such
-a stop is forceful because Windows does not have signals.`,
+It requires that the admin API is enabled and accessible, since it will
+use the API's /stop endpoint. The address of this request can be
+customized using the --address flag if it is not the default.`,
 		Flags: func() *flag.FlagSet {
 			fs := flag.NewFlagSet("stop", flag.ExitOnError)
 			fs.String("address", "", "The address to use to reach the admin API endpoint, if not the default")
@@ -186,6 +192,12 @@ config file; otherwise the default is assumed.`,
 			fs.Bool("versions", false, "Print version information")
 			return fs
 		}(),
+	})
+
+	RegisterCommand(Command{
+		Name:  "build-info",
+		Func:  cmdBuildInfo,
+		Short: "Prints information about this build",
 	})
 
 	RegisterCommand(Command{
@@ -236,6 +248,24 @@ provisioning stages.`,
 		}(),
 	})
 
+	RegisterCommand(Command{
+		Name:  "fmt",
+		Func:  cmdFmt,
+		Usage: "[--overwrite] [<path>]",
+		Short: "Formats a Caddyfile",
+		Long: `
+Formats the Caddyfile by adding proper indentation and spaces to improve
+human readability. It prints the result to stdout.
+
+If --write is specified, the output will be written to the config file
+directly instead of printing it.`,
+		Flags: func() *flag.FlagSet {
+			fs := flag.NewFlagSet("format", flag.ExitOnError)
+			fs.Bool("overwrite", false, "Overwrite the input file with the results")
+			return fs
+		}(),
+	})
+
 }
 
 // RegisterCommand registers the command cmd.
@@ -250,6 +280,8 @@ provisioning stages.`,
 // This function panics if the name is already registered,
 // if the name does not meet the described format, or if
 // any of the fields are missing from cmd.
+//
+// This function should be used in init().
 func RegisterCommand(cmd Command) {
 	if cmd.Name == "" {
 		panic("command name is required")

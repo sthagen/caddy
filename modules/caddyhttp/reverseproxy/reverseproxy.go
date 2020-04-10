@@ -24,7 +24,6 @@ import (
 	"net"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,15 +40,51 @@ func init() {
 }
 
 // Handler implements a highly configurable and production-ready reverse proxy.
+//
+// Upon proxying, this module sets the following placeholders (which can be used
+// both within and after this handler):
+//
+// Placeholder | Description
+// ------------|-------------
+// `{http.reverse_proxy.upstream.address}` | The full address to the upstream as given in the config
+// `{http.reverse_proxy.upstream.hostport}` | The host:port of the upstream
+// `{http.reverse_proxy.upstream.host}` | The host of the upstream
+// `{http.reverse_proxy.upstream.port}` | The port of the upstream
+// `{http.reverse_proxy.upstream.requests}` | The approximate current number of requests to the upstream
+// `{http.reverse_proxy.upstream.max_requests}` | The maximum approximate number of requests allowed to the upstream
+// `{http.reverse_proxy.upstream.fails}` | The number of recent failed requests to the upstream
 type Handler struct {
-	TransportRaw   json.RawMessage  `json:"transport,omitempty"`
-	CBRaw          json.RawMessage  `json:"circuit_breaker,omitempty"`
-	LoadBalancing  *LoadBalancing   `json:"load_balancing,omitempty"`
-	HealthChecks   *HealthChecks    `json:"health_checks,omitempty"`
-	Upstreams      UpstreamPool     `json:"upstreams,omitempty"`
-	FlushInterval  caddy.Duration   `json:"flush_interval,omitempty"`
-	Headers        *headers.Handler `json:"headers,omitempty"`
-	BufferRequests bool             `json:"buffer_requests,omitempty"`
+	// Configures the method of transport for the proxy. A transport
+	// is what performs the actual "round trip" to the backend.
+	// The default transport is plaintext HTTP.
+	TransportRaw json.RawMessage `json:"transport,omitempty" caddy:"namespace=http.reverse_proxy.transport inline_key=protocol"`
+
+	// A circuit breaker may be used to relieve pressure on a backend
+	// that is beginning to exhibit symptoms of stress or latency.
+	// By default, there is no circuit breaker.
+	CBRaw json.RawMessage `json:"circuit_breaker,omitempty" caddy:"namespace=http.reverse_proxy.circuit_breakers inline_key=type"`
+
+	// Load balancing distributes load/requests between backends.
+	LoadBalancing *LoadBalancing `json:"load_balancing,omitempty"`
+
+	// Health checks update the status of backends, whether they are
+	// up or down. Down backends will not be proxied to.
+	HealthChecks *HealthChecks `json:"health_checks,omitempty"`
+
+	// Upstreams is the list of backends to proxy to.
+	Upstreams UpstreamPool `json:"upstreams,omitempty"`
+
+	// TODO: figure out good defaults and write docs for this
+	// (see https://github.com/caddyserver/caddy/issues/1460)
+	FlushInterval caddy.Duration `json:"flush_interval,omitempty"`
+
+	// Headers manipulates headers between Caddy and the backend.
+	Headers *headers.Handler `json:"headers,omitempty"`
+
+	// If true, the entire request body will be read and buffered
+	// in memory before being proxied to the backend. This should
+	// be avoided if at all possible for performance reasons.
+	BufferRequests bool `json:"buffer_requests,omitempty"`
 
 	Transport http.RoundTripper `json:"-"`
 	CB        CircuitBreaker    `json:"-"`
@@ -60,8 +95,8 @@ type Handler struct {
 // CaddyModule returns the Caddy module information.
 func (Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		Name: "http.handlers.reverse_proxy",
-		New:  func() caddy.Module { return new(Handler) },
+		ID:  "http.handlers.reverse_proxy",
+		New: func() caddy.Module { return new(Handler) },
 	}
 }
 
@@ -71,30 +106,25 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 	// start by loading modules
 	if h.TransportRaw != nil {
-		val, err := ctx.LoadModuleInline("protocol", "http.handlers.reverse_proxy.transport", h.TransportRaw)
+		mod, err := ctx.LoadModule(h, "TransportRaw")
 		if err != nil {
-			return fmt.Errorf("loading transport module: %s", err)
+			return fmt.Errorf("loading transport: %v", err)
 		}
-		h.Transport = val.(http.RoundTripper)
-		h.TransportRaw = nil // allow GC to deallocate
+		h.Transport = mod.(http.RoundTripper)
 	}
 	if h.LoadBalancing != nil && h.LoadBalancing.SelectionPolicyRaw != nil {
-		val, err := ctx.LoadModuleInline("policy",
-			"http.handlers.reverse_proxy.selection_policies",
-			h.LoadBalancing.SelectionPolicyRaw)
+		mod, err := ctx.LoadModule(h.LoadBalancing, "SelectionPolicyRaw")
 		if err != nil {
-			return fmt.Errorf("loading load balancing selection module: %s", err)
+			return fmt.Errorf("loading load balancing selection policy: %s", err)
 		}
-		h.LoadBalancing.SelectionPolicy = val.(Selector)
-		h.LoadBalancing.SelectionPolicyRaw = nil // allow GC to deallocate
+		h.LoadBalancing.SelectionPolicy = mod.(Selector)
 	}
 	if h.CBRaw != nil {
-		val, err := ctx.LoadModuleInline("type", "http.handlers.reverse_proxy.circuit_breakers", h.CBRaw)
+		mod, err := ctx.LoadModule(h, "CBRaw")
 		if err != nil {
-			return fmt.Errorf("loading circuit breaker module: %s", err)
+			return fmt.Errorf("loading circuit breaker: %s", err)
 		}
-		h.CB = val.(CircuitBreaker)
-		h.CBRaw = nil // allow GC to deallocate
+		h.CB = mod.(CircuitBreaker)
 	}
 
 	// set up transport
@@ -128,50 +158,20 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		// defaulting to a sane wait period between attempts
 		h.LoadBalancing.TryInterval = caddy.Duration(250 * time.Millisecond)
 	}
-	lbMatcherSets, err := h.LoadBalancing.RetryMatchRaw.Setup(ctx)
+	lbMatcherSets, err := ctx.LoadModule(h.LoadBalancing, "RetryMatchRaw")
 	if err != nil {
 		return err
 	}
-	h.LoadBalancing.RetryMatch = lbMatcherSets
-	h.LoadBalancing.RetryMatchRaw = nil // allow GC to deallocate
-
-	// if active health checks are enabled, configure them and start a worker
-	if h.HealthChecks != nil &&
-		h.HealthChecks.Active != nil &&
-		(h.HealthChecks.Active.Path != "" || h.HealthChecks.Active.Port != 0) {
-		h.HealthChecks.Active.logger = h.logger.Named("health_checker.active")
-
-		timeout := time.Duration(h.HealthChecks.Active.Timeout)
-		if timeout == 0 {
-			timeout = 10 * time.Second
-		}
-
-		h.HealthChecks.Active.stopChan = make(chan struct{})
-		h.HealthChecks.Active.httpClient = &http.Client{
-			Timeout:   timeout,
-			Transport: h.Transport,
-		}
-
-		if h.HealthChecks.Active.Interval == 0 {
-			h.HealthChecks.Active.Interval = caddy.Duration(30 * time.Second)
-		}
-
-		if h.HealthChecks.Active.ExpectBody != "" {
-			var err error
-			h.HealthChecks.Active.bodyRegexp, err = regexp.Compile(h.HealthChecks.Active.ExpectBody)
-			if err != nil {
-				return fmt.Errorf("expect_body: compiling regular expression: %v", err)
-			}
-		}
-
-		go h.activeHealthChecker()
+	err = h.LoadBalancing.RetryMatch.FromInterface(lbMatcherSets)
+	if err != nil {
+		return err
 	}
 
 	// set up upstreams
 	for _, upstream := range h.Upstreams {
 		// create or get the host representation for this upstream
 		var host Host = new(upstreamHost)
-		existingHost, loaded := hosts.LoadOrStore(upstream.Dial, host)
+		existingHost, loaded := hosts.LoadOrStore(upstream.String(), host)
 		if loaded {
 			host = existingHost.(Host)
 		}
@@ -202,6 +202,38 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 	}
 
+	// if active health checks are enabled, configure them and start a worker
+	if h.HealthChecks != nil &&
+		h.HealthChecks.Active != nil &&
+		(h.HealthChecks.Active.Path != "" || h.HealthChecks.Active.Port != 0) {
+		h.HealthChecks.Active.logger = h.logger.Named("health_checker.active")
+
+		timeout := time.Duration(h.HealthChecks.Active.Timeout)
+		if timeout == 0 {
+			timeout = 5 * time.Second
+		}
+
+		h.HealthChecks.Active.stopChan = make(chan struct{})
+		h.HealthChecks.Active.httpClient = &http.Client{
+			Timeout:   timeout,
+			Transport: h.Transport,
+		}
+
+		if h.HealthChecks.Active.Interval == 0 {
+			h.HealthChecks.Active.Interval = caddy.Duration(30 * time.Second)
+		}
+
+		if h.HealthChecks.Active.ExpectBody != "" {
+			var err error
+			h.HealthChecks.Active.bodyRegexp, err = regexp.Compile(h.HealthChecks.Active.ExpectBody)
+			if err != nil {
+				return fmt.Errorf("expect_body: compiling regular expression: %v", err)
+			}
+		}
+
+		go h.activeHealthChecker()
+	}
+
 	return nil
 }
 
@@ -211,6 +243,7 @@ func (h *Handler) Cleanup() error {
 	if h.HealthChecks != nil &&
 		h.HealthChecks.Active != nil &&
 		h.HealthChecks.Active.stopChan != nil {
+		// TODO: consider using context cancellation, could be much simpler
 		close(h.HealthChecks.Active.stopChan)
 	}
 
@@ -218,14 +251,14 @@ func (h *Handler) Cleanup() error {
 
 	// remove hosts from our config from the pool
 	for _, upstream := range h.Upstreams {
-		hosts.Delete(upstream.Dial)
+		hosts.Delete(upstream.String())
 	}
 
 	return nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(caddy.Replacer)
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 	// if enabled, buffer client request;
 	// this should only be enabled if the
@@ -279,7 +312,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		// the dial address may vary per-request if placeholders are
 		// used, so perform those replacements here; the resulting
 		// DialInfo struct should have valid network address syntax
-		dialInfo, err := fillDialInfo(upstream, repl)
+		dialInfo, err := upstream.fillDialInfo(r)
 		if err != nil {
 			return fmt.Errorf("making dial info: %v", err)
 		}
@@ -287,17 +320,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		// attach to the request information about how to dial the upstream;
 		// this is necessary because the information cannot be sufficiently
 		// or satisfactorily represented in a URL
-		ctx := context.WithValue(r.Context(), DialInfoCtxKey, dialInfo)
-		r = r.WithContext(ctx)
+		caddyhttp.SetVar(r.Context(), dialInfoVarKey, dialInfo)
 
 		// set placeholders with information about this upstream
-		repl.Set("http.handlers.reverse_proxy.upstream.address", dialInfo.String())
-		repl.Set("http.handlers.reverse_proxy.upstream.hostport", dialInfo.Address)
-		repl.Set("http.handlers.reverse_proxy.upstream.host", dialInfo.Host)
-		repl.Set("http.handlers.reverse_proxy.upstream.port", dialInfo.Port)
-		repl.Set("http.handlers.reverse_proxy.upstream.requests", strconv.Itoa(upstream.Host.NumRequests()))
-		repl.Set("http.handlers.reverse_proxy.upstream.max_requests", strconv.Itoa(upstream.MaxRequests))
-		repl.Set("http.handlers.reverse_proxy.upstream.fails", strconv.Itoa(upstream.Host.Fails()))
+		repl.Set("http.reverse_proxy.upstream.address", dialInfo.String())
+		repl.Set("http.reverse_proxy.upstream.hostport", dialInfo.Address)
+		repl.Set("http.reverse_proxy.upstream.host", dialInfo.Host)
+		repl.Set("http.reverse_proxy.upstream.port", dialInfo.Port)
+		repl.Set("http.reverse_proxy.upstream.requests", upstream.Host.NumRequests())
+		repl.Set("http.reverse_proxy.upstream.max_requests", upstream.MaxRequests)
+		repl.Set("http.reverse_proxy.upstream.fails", upstream.Host.Fails())
 
 		// mutate request headers according to this upstream;
 		// because we're in a retry loop, we have to copy
@@ -407,20 +439,22 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, di Dia
 	// do the round-trip
 	start := time.Now()
 	res, err := h.Transport.RoundTrip(req)
-	latency := time.Since(start)
+	duration := time.Since(start)
 	if err != nil {
 		return err
 	}
 
 	h.logger.Debug("upstream roundtrip",
+		zap.String("upstream", di.Upstream.String()),
 		zap.Object("request", caddyhttp.LoggableHTTPRequest{Request: req}),
 		zap.Object("headers", caddyhttp.LoggableHTTPHeader(res.Header)),
+		zap.Duration("duration", duration),
 		zap.Int("status", res.StatusCode),
 	)
 
 	// update circuit breaker on current conditions
 	if di.Upstream.cb != nil {
-		di.Upstream.cb.RecordMetric(res.StatusCode, latency)
+		di.Upstream.cb.RecordMetric(res.StatusCode, duration)
 	}
 
 	// perform passive health checks (if enabled)
@@ -434,7 +468,7 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, di Dia
 
 		// strike if the roundtrip took too long
 		if h.HealthChecks.Passive.UnhealthyLatency > 0 &&
-			latency >= time.Duration(h.HealthChecks.Passive.UnhealthyLatency) {
+			duration >= time.Duration(h.HealthChecks.Passive.UnhealthyLatency) {
 			h.countFailure(di.Upstream)
 		}
 	}
@@ -468,7 +502,7 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, di Dia
 	if h.Headers != nil && h.Headers.Response != nil {
 		if h.Headers.Response.Require == nil ||
 			h.Headers.Response.Require.Match(res.StatusCode, rw.Header()) {
-			repl := req.Context().Value(caddy.ReplacerCtxKey).(caddy.Replacer)
+			repl := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 			h.Headers.Response.ApplyTo(rw.Header(), repl)
 		}
 	}
@@ -651,10 +685,30 @@ func removeConnectionHeaders(h http.Header) {
 
 // LoadBalancing has parameters related to load balancing.
 type LoadBalancing struct {
-	SelectionPolicyRaw json.RawMessage          `json:"selection_policy,omitempty"`
-	TryDuration        caddy.Duration           `json:"try_duration,omitempty"`
-	TryInterval        caddy.Duration           `json:"try_interval,omitempty"`
-	RetryMatchRaw      caddyhttp.RawMatcherSets `json:"retry_match,omitempty"`
+	// A selection policy is how to choose an available backend.
+	// The default policy is random selection.
+	SelectionPolicyRaw json.RawMessage `json:"selection_policy,omitempty" caddy:"namespace=http.reverse_proxy.selection_policies inline_key=policy"`
+
+	// How long to try selecting available backends for each request
+	// if the next available host is down. By default, this retry is
+	// disabled. Clients will wait for up to this long while the load
+	// balancer tries to find an available upstream host.
+	TryDuration caddy.Duration `json:"try_duration,omitempty"`
+
+	// How long to wait between selecting the next host from the pool. Default
+	// is 250ms. Only relevant when a request to an upstream host fails. Be
+	// aware that setting this to 0 with a non-zero try_duration can cause the
+	// CPU to spin if all backends are down and latency is very low.
+	TryInterval caddy.Duration `json:"try_interval,omitempty"`
+
+	// A list of matcher sets that restricts with which requests retries are
+	// allowed. A request must match any of the given matcher sets in order
+	// to be retried if the connection to the upstream succeeded but the
+	// subsequent round-trip failed. If the connection to the upstream failed,
+	// a retry is always allowed. If unspecified, only GET requests will be
+	// allowed to be retried. Note that a retry is done with the next available
+	// host according to the load balancing policy.
+	RetryMatchRaw caddyhttp.RawMatcherSets `json:"retry_match,omitempty" caddy:"namespace=http.matchers"`
 
 	SelectionPolicy Selector              `json:"-"`
 	RetryMatch      caddyhttp.MatcherSets `json:"-"`
@@ -671,6 +725,7 @@ type Selector interface {
 // obsoleted RFC 2616 (section 13.5.1) and are used for backward
 // compatibility.
 var hopHeaders = []string{
+	"Alt-Svc",
 	"Connection",
 	"Proxy-Connection", // non-standard but still sent by libcurl and rejected by e.g. google
 	"Keep-Alive",
@@ -684,8 +739,19 @@ var hopHeaders = []string{
 
 // DialError is an error that specifically occurs
 // in a call to Dial or DialContext.
-type DialError struct {
-	error
+type DialError struct{ error }
+
+// TLSTransport is implemented by transports
+// that are capable of using TLS.
+type TLSTransport interface {
+	// TLSEnabled returns true if the transport
+	// has TLS enabled, false otherwise.
+	TLSEnabled() bool
+
+	// EnableTLS enables TLS within the transport
+	// if it is not already, using the provided
+	// value as a basis for the TLS config.
+	EnableTLS(base *TLSConfig) error
 }
 
 var bufPool = sync.Pool{

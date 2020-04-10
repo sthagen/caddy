@@ -183,13 +183,23 @@ func TestPathMatcher(t *testing.T) {
 			expect: false,
 		},
 		{
+			match:  MatchPath{"/foo/bar/"},
+			input:  "/foo/bar/",
+			expect: true,
+		},
+		{
 			match:  MatchPath{"/foo/bar/", "/other"},
 			input:  "/other/",
+			expect: false,
+		},
+		{
+			match:  MatchPath{"/foo/bar/", "/other"},
+			input:  "/other",
 			expect: true,
 		},
 		{
 			match:  MatchPath{"*.ext"},
-			input:  "/foo.ext",
+			input:  "/foo/bar.ext",
 			expect: true,
 		},
 		{
@@ -213,19 +223,19 @@ func TestPathMatcher(t *testing.T) {
 			expect: false,
 		},
 		{
-			match:  MatchPath{"=/foo"},
-			input:  "/foo",
+			match:  MatchPath{"*substring*"},
+			input:  "/foo/substring/bar.txt",
 			expect: true,
 		},
 		{
-			match:  MatchPath{"=/foo"},
+			match:  MatchPath{"/foo"},
 			input:  "/foo/bar",
 			expect: false,
 		},
 		{
-			match:  MatchPath{"=/foo"},
-			input:  "/FOO",
-			expect: true,
+			match:  MatchPath{"/foo"},
+			input:  "/foo/bar",
+			expect: false,
 		},
 		{
 			match:  MatchPath{"/foo"},
@@ -233,17 +243,63 @@ func TestPathMatcher(t *testing.T) {
 			expect: true,
 		},
 		{
+			match:  MatchPath{"/foo*"},
+			input:  "/FOOOO",
+			expect: true,
+		},
+		{
 			match:  MatchPath{"/foo/bar.txt"},
 			input:  "/foo/BAR.txt",
 			expect: true,
 		},
+		{
+			match:  MatchPath{"*"},
+			input:  "/",
+			expect: true,
+		},
+		{
+			match:  MatchPath{"*"},
+			input:  "/foo/bar",
+			expect: true,
+		},
+		{
+			match:  MatchPath{"**"},
+			input:  "/",
+			expect: true,
+		},
+		{
+			match:  MatchPath{"**"},
+			input:  "/foo/bar",
+			expect: true,
+		},
 	} {
 		req := &http.Request{URL: &url.URL{Path: tc.input}}
+		repl := caddy.NewReplacer()
+		ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+		req = req.WithContext(ctx)
+
 		actual := tc.match.Match(req)
 		if actual != tc.expect {
 			t.Errorf("Test %d %v: Expected %t, got %t for '%s'", i, tc.match, tc.expect, actual, tc.input)
 			continue
 		}
+	}
+}
+
+func TestPathMatcherWindows(t *testing.T) {
+	// only Windows has this bug where it will ignore
+	// trailing dots and spaces in a filename, but we
+	// test for it on all platforms to be more consistent
+
+	req := &http.Request{URL: &url.URL{Path: "/index.php . . .."}}
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+
+	match := MatchPath{"*.php"}
+	matched := match.Match(req)
+	if !matched {
+		t.Errorf("Expected to match; should ignore trailing dots and spaces")
 	}
 }
 
@@ -339,6 +395,7 @@ func TestHeaderMatcher(t *testing.T) {
 	for i, tc := range []struct {
 		match  MatchHeader
 		input  http.Header // make sure these are canonical cased (std lib will do that in a real request)
+		host   string
 		expect bool
 	}{
 		{
@@ -381,8 +438,30 @@ func TestHeaderMatcher(t *testing.T) {
 			input:  http.Header{"Field1": []string{"foo"}, "Field2": []string{"kapow"}},
 			expect: false,
 		},
+		{
+			match:  MatchHeader{"field1": []string{"*"}},
+			input:  http.Header{"Field1": []string{"foo"}},
+			expect: true,
+		},
+		{
+			match:  MatchHeader{"field1": []string{"*"}},
+			input:  http.Header{"Field2": []string{"foo"}},
+			expect: false,
+		},
+		{
+			match:  MatchHeader{"host": []string{"localhost"}},
+			input:  http.Header{},
+			host:   "localhost",
+			expect: true,
+		},
+		{
+			match:  MatchHeader{"host": []string{"localhost"}},
+			input:  http.Header{},
+			host:   "caddyserver.com",
+			expect: false,
+		},
 	} {
-		req := &http.Request{Header: tc.input}
+		req := &http.Request{Header: tc.input, Host: tc.host}
 		actual := tc.match.Match(req)
 		if actual != tc.expect {
 			t.Errorf("Test %d %v: Expected %t, got %t for '%s'", i, tc.match, tc.expect, actual, tc.input)
@@ -451,6 +530,7 @@ func TestHeaderREMatcher(t *testing.T) {
 	for i, tc := range []struct {
 		match      MatchHeaderRE
 		input      http.Header // make sure these are canonical cased (std lib will do that in a real request)
+		host       string
 		expect     bool
 		expectRepl map[string]string
 	}{
@@ -470,6 +550,23 @@ func TestHeaderREMatcher(t *testing.T) {
 			expect:     true,
 			expectRepl: map[string]string{"name.1": "bar"},
 		},
+		{
+			match:  MatchHeaderRE{"Field": &MatchRegexp{Pattern: "^foo.*$", Name: "name"}},
+			input:  http.Header{"Field": []string{"barfoo", "foobar"}},
+			expect: true,
+		},
+		{
+			match:  MatchHeaderRE{"host": &MatchRegexp{Pattern: "^localhost$", Name: "name"}},
+			input:  http.Header{},
+			host:   "localhost",
+			expect: true,
+		},
+		{
+			match:  MatchHeaderRE{"host": &MatchRegexp{Pattern: "^local$", Name: "name"}},
+			input:  http.Header{},
+			host:   "localhost",
+			expect: false,
+		},
 	} {
 		// compile the regexp and validate its name
 		err := tc.match.Provision(caddy.Context{})
@@ -484,7 +581,7 @@ func TestHeaderREMatcher(t *testing.T) {
 		}
 
 		// set up the fake request and its Replacer
-		req := &http.Request{Header: tc.input, URL: new(url.URL)}
+		req := &http.Request{Header: tc.input, URL: new(url.URL), Host: tc.host}
 		repl := caddy.NewReplacer()
 		ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
 		req = req.WithContext(ctx)
@@ -506,6 +603,92 @@ func TestHeaderREMatcher(t *testing.T) {
 				continue
 			}
 		}
+	}
+}
+
+func TestVarREMatcher(t *testing.T) {
+	for i, tc := range []struct {
+		desc       string
+		match      MatchVarsRE
+		input      VarsMiddleware
+		expect     bool
+		expectRepl map[string]string
+	}{
+		{
+			desc:   "match static value within var set by the VarsMiddleware succeeds",
+			match:  MatchVarsRE{"Var1": &MatchRegexp{Pattern: "foo"}},
+			input:  VarsMiddleware{"Var1": "here is foo val"},
+			expect: true,
+		},
+		{
+			desc:   "value set by VarsMiddleware not satisfying regexp matcher fails to match",
+			match:  MatchVarsRE{"Var1": &MatchRegexp{Pattern: "$foo^"}},
+			input:  VarsMiddleware{"Var1": "foobar"},
+			expect: false,
+		},
+		{
+			desc:       "successfully matched value is captured and its placeholder is added to replacer",
+			match:      MatchVarsRE{"Var1": &MatchRegexp{Pattern: "^foo(.*)$", Name: "name"}},
+			input:      VarsMiddleware{"Var1": "foobar"},
+			expect:     true,
+			expectRepl: map[string]string{"name.1": "bar"},
+		},
+		{
+			desc:   "matching against a value of standard variables succeeds",
+			match:  MatchVarsRE{"{http.request.method}": &MatchRegexp{Pattern: "^G.[tT]$"}},
+			input:  VarsMiddleware{},
+			expect: true,
+		},
+		{
+			desc:   "matching against value of var set by the VarsMiddleware and referenced by its placeholder succeeds",
+			match:  MatchVarsRE{"{http.vars.Var1}": &MatchRegexp{Pattern: "[vV]ar[0-9]"}},
+			input:  VarsMiddleware{"Var1": "var1Value"},
+			expect: true,
+		},
+	} {
+		tc := tc // capture range value
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+			// compile the regexp and validate its name
+			err := tc.match.Provision(caddy.Context{})
+			if err != nil {
+				t.Errorf("Test %d %v: Provisioning: %v", i, tc.match, err)
+				return
+			}
+			err = tc.match.Validate()
+			if err != nil {
+				t.Errorf("Test %d %v: Validating: %v", i, tc.match, err)
+				return
+			}
+
+			// set up the fake request and its Replacer
+			req := &http.Request{URL: new(url.URL), Method: http.MethodGet}
+			repl := caddy.NewReplacer()
+			ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+			ctx = context.WithValue(ctx, VarsCtxKey, make(map[string]interface{}))
+			req = req.WithContext(ctx)
+
+			addHTTPVarsToReplacer(repl, req, httptest.NewRecorder())
+
+			tc.input.ServeHTTP(httptest.NewRecorder(), req, emptyHandler)
+
+			actual := tc.match.Match(req)
+			if actual != tc.expect {
+				t.Errorf("Test %d [%v]: Expected %t, got %t for input '%s'",
+					i, tc.match, tc.expect, actual, tc.input)
+				return
+			}
+
+			for key, expectVal := range tc.expectRepl {
+				placeholder := fmt.Sprintf("{http.regexp.%s}", key)
+				actualVal := repl.ReplaceAll(placeholder, "<empty>")
+				if actualVal != expectVal {
+					t.Errorf("Test %d [%v]: Expected placeholder {http.regexp.%s} to be '%s' but got '%s'",
+						i, tc.match, key, expectVal, actualVal)
+					return
+				}
+			}
+		})
 	}
 }
 
@@ -635,6 +818,119 @@ func TestResponseMatcher(t *testing.T) {
 		actual := tc.require.Match(tc.status, tc.hdr)
 		if actual != tc.expect {
 			t.Errorf("Test %d %v: Expected %t, got %t for HTTP %d %v", i, tc.require, tc.expect, actual, tc.status, tc.hdr)
+			continue
+		}
+	}
+}
+
+func TestNotMatcher(t *testing.T) {
+	for i, tc := range []struct {
+		host, path string
+		match      MatchNot
+		expect     bool
+	}{
+		{
+			host: "example.com", path: "/",
+			match:  MatchNot{},
+			expect: true,
+		},
+		{
+			host: "example.com", path: "/foo",
+			match: MatchNot{
+				MatcherSets: []MatcherSet{
+					{
+						MatchPath{"/foo"},
+					},
+				},
+			},
+			expect: false,
+		},
+		{
+			host: "example.com", path: "/bar",
+			match: MatchNot{
+				MatcherSets: []MatcherSet{
+					{
+						MatchPath{"/foo"},
+					},
+				},
+			},
+			expect: true,
+		},
+		{
+			host: "example.com", path: "/bar",
+			match: MatchNot{
+				MatcherSets: []MatcherSet{
+					{
+						MatchPath{"/foo"},
+					},
+					{
+						MatchHost{"example.com"},
+					},
+				},
+			},
+			expect: false,
+		},
+		{
+			host: "example.com", path: "/bar",
+			match: MatchNot{
+				MatcherSets: []MatcherSet{
+					{
+						MatchPath{"/bar"},
+					},
+					{
+						MatchHost{"example.com"},
+					},
+				},
+			},
+			expect: false,
+		},
+		{
+			host: "example.com", path: "/foo",
+			match: MatchNot{
+				MatcherSets: []MatcherSet{
+					{
+						MatchPath{"/bar"},
+					},
+					{
+						MatchHost{"sub.example.com"},
+					},
+				},
+			},
+			expect: true,
+		},
+		{
+			host: "example.com", path: "/foo",
+			match: MatchNot{
+				MatcherSets: []MatcherSet{
+					{
+						MatchPath{"/foo"},
+						MatchHost{"example.com"},
+					},
+				},
+			},
+			expect: false,
+		},
+		{
+			host: "example.com", path: "/foo",
+			match: MatchNot{
+				MatcherSets: []MatcherSet{
+					{
+						MatchPath{"/bar"},
+						MatchHost{"example.com"},
+					},
+				},
+			},
+			expect: true,
+		},
+	} {
+		req := &http.Request{Host: tc.host, URL: &url.URL{Path: tc.path}}
+		repl := caddy.NewReplacer()
+		ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+		req = req.WithContext(ctx)
+
+		actual := tc.match.Match(req)
+		if actual != tc.expect {
+			t.Errorf("Test %d %+v: Expected %t, got %t for: host=%s path=%s'", i, tc.match, tc.expect, actual, tc.host, tc.path)
 			continue
 		}
 	}

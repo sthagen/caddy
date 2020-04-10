@@ -16,11 +16,11 @@ package caddyhttp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -31,24 +31,86 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-// Server is an HTTP server.
+// Server describes an HTTP server.
 type Server struct {
-	Listen            []string                    `json:"listen,omitempty"`
-	ReadTimeout       caddy.Duration              `json:"read_timeout,omitempty"`
-	ReadHeaderTimeout caddy.Duration              `json:"read_header_timeout,omitempty"`
-	WriteTimeout      caddy.Duration              `json:"write_timeout,omitempty"`
-	IdleTimeout       caddy.Duration              `json:"idle_timeout,omitempty"`
-	MaxHeaderBytes    int                         `json:"max_header_bytes,omitempty"`
-	Routes            RouteList                   `json:"routes,omitempty"`
-	Errors            *HTTPErrorConfig            `json:"errors,omitempty"`
-	TLSConnPolicies   caddytls.ConnectionPolicies `json:"tls_connection_policies,omitempty"`
-	AutoHTTPS         *AutoHTTPSConfig            `json:"automatic_https,omitempty"`
-	MaxRehandles      *int                        `json:"max_rehandles,omitempty"`
-	StrictSNIHost     *bool                       `json:"strict_sni_host,omitempty"`
-	Logs              *ServerLogConfig            `json:"logs,omitempty"`
+	// Socket addresses to which to bind listeners. Accepts
+	// [network addresses](/docs/conventions#network-addresses)
+	// that may include port ranges.
+	Listen []string `json:"listen,omitempty"`
 
-	// This field is not subject to compatibility promises
+	// A list of listener wrapper modules, which can modify the behavior
+	// of the base listener. They are applied in the given order.
+	ListenerWrappersRaw []json.RawMessage `json:"listener_wrappers,omitempty" caddy:"namespace=caddy.listeners inline_key=wrapper"`
+
+	// How long to allow a read from a client's upload. Setting this
+	// to a short, non-zero value can mitigate slowloris attacks, but
+	// may also affect legitimately slow clients.
+	ReadTimeout caddy.Duration `json:"read_timeout,omitempty"`
+
+	// ReadHeaderTimeout is like ReadTimeout but for request headers.
+	ReadHeaderTimeout caddy.Duration `json:"read_header_timeout,omitempty"`
+
+	// WriteTimeout is how long to allow a write to a client. Note
+	// that setting this to a small value when serving large files
+	// may negatively affect legitimately slow clients.
+	WriteTimeout caddy.Duration `json:"write_timeout,omitempty"`
+
+	// IdleTimeout is the maximum time to wait for the next request
+	// when keep-alives are enabled. If zero, ReadTimeout is used.
+	// If both are zero, there is no timeout.
+	IdleTimeout caddy.Duration `json:"idle_timeout,omitempty"`
+
+	// MaxHeaderBytes is the maximum size to parse from a client's
+	// HTTP request headers.
+	MaxHeaderBytes int `json:"max_header_bytes,omitempty"`
+
+	// Routes describes how this server will handle requests.
+	// Routes are executed sequentially. First a route's matchers
+	// are evaluated, then its grouping. If it matches and has
+	// not been mutually-excluded by its grouping, then its
+	// handlers are executed sequentially. The sequence of invoked
+	// handlers comprises a compiled middleware chain that flows
+	// from each matching route and its handlers to the next.
+	Routes RouteList `json:"routes,omitempty"`
+
+	// Errors is how this server will handle errors returned from any
+	// of the handlers in the primary routes. If the primary handler
+	// chain returns an error, the error along with its recommended
+	// status code are bubbled back up to the HTTP server which
+	// executes a separate error route, specified using this property.
+	// The error routes work exactly like the normal routes.
+	Errors *HTTPErrorConfig `json:"errors,omitempty"`
+
+	// How to handle TLS connections. At least one policy is
+	// required to enable HTTPS on this server if automatic
+	// HTTPS is disabled or does not apply.
+	TLSConnPolicies caddytls.ConnectionPolicies `json:"tls_connection_policies,omitempty"`
+
+	// AutoHTTPS configures or disables automatic HTTPS within this server.
+	// HTTPS is enabled automatically and by default when qualifying names
+	// are present in a Host matcher and/or when the server is listening
+	// only on the HTTPS port.
+	AutoHTTPS *AutoHTTPSConfig `json:"automatic_https,omitempty"`
+
+	// If true, will require that a request's Host header match
+	// the value of the ServerName sent by the client's TLS
+	// ClientHello; often a necessary safeguard when using TLS
+	// client authentication.
+	StrictSNIHost *bool `json:"strict_sni_host,omitempty"`
+
+	// Customizes how access logs are handled in this server. To
+	// minimally enable access logs, simply set this to a non-null,
+	// empty struct.
+	Logs *ServerLogConfig `json:"logs,omitempty"`
+
+	// Enable experimental HTTP/3 support. Note that HTTP/3 is not a
+	// finished standard and has extremely limited client support.
+	// This field is not subject to compatibility promises.
 	ExperimentalHTTP3 bool `json:"experimental_http3,omitempty"`
+
+	primaryHandlerChain Handler
+	errorHandlerChain   Handler
+	listenerWrappers    []caddy.ListenerWrapper
 
 	tlsApp       *caddytls.TLS
 	logger       *zap.Logger
@@ -74,6 +136,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := context.WithValue(r.Context(), caddy.ReplacerCtxKey, repl)
 	ctx = context.WithValue(ctx, ServerCtxKey, s)
 	ctx = context.WithValue(ctx, VarsCtxKey, make(map[string]interface{}))
+	ctx = context.WithValue(ctx, routeGroupCtxKey, make(map[string]struct{}))
 	var url2 url.URL // avoid letting this escape to the heap
 	ctx = context.WithValue(ctx, OriginalRequestCtxKey, originalRequest(r, &url2))
 	r = r.WithContext(ctx)
@@ -82,33 +145,33 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// anymore, finish setting up the replacer
 	addHTTPVarsToReplacer(repl, r, w)
 
-	loggableReq := LoggableHTTPRequest{r}
+	// encode the request for logging purposes before
+	// it enters any handler chain; this is necessary
+	// to capture the original request in case it gets
+	// modified during handling
+	loggableReq := zap.Object("request", LoggableHTTPRequest{r})
 	errLog := s.errorLogger.With(
-		// encode the request for logging purposes before
-		// it enters any handler chain; this is necessary
-		// to capture the original request in case it gets
-		// modified during handling
-		zap.Object("request", loggableReq),
+		loggableReq,
 	)
 
 	if s.accessLogger != nil {
 		wrec := NewResponseRecorder(w, nil, nil)
 		w = wrec
-		accLog := s.accessLogger.With(
-			// capture the original version of the request
-			zap.Object("request", loggableReq),
-		)
+
+		// capture the original version of the request
+		accLog := s.accessLogger.With(loggableReq)
+
 		start := time.Now()
 		defer func() {
 			latency := time.Since(start)
 
-			repl.Set("http.response.status", strconv.Itoa(wrec.Status()))
-			repl.Set("http.response.size", strconv.Itoa(wrec.Size()))
-			repl.Set("http.response.latency", latency.String())
+			repl.Set("http.response.status", wrec.Status())
+			repl.Set("http.response.size", wrec.Size())
+			repl.Set("http.response.latency", latency)
 
 			logger := accLog
-			if s.Logs != nil && s.Logs.LoggerNames != nil {
-				logger = logger.Named(s.Logs.LoggerNames[r.Host])
+			if s.Logs != nil {
+				logger = s.Logs.wrapLogger(logger, r.Host)
 			}
 
 			log := logger.Info
@@ -117,7 +180,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 
 			log("handled request",
-				zap.String("common_log", repl.ReplaceAll(CommonLogFormat, "-")),
+				zap.String("common_log", repl.ReplaceAll(commonLogFormat, commonLogEmptyValue)),
 				zap.Duration("latency", latency),
 				zap.Int("size", wrec.Size()),
 				zap.Int("status", wrec.Status()),
@@ -132,13 +195,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// build and execute the primary handler chain
-	err := s.executeCompositeRoute(w, r, s.Routes)
+	// execute the primary handler chain
+	err := s.primaryHandlerChain.ServeHTTP(w, r)
 	if err != nil {
 		// prepare the error log
 		logger := errLog
-		if s.Logs != nil && s.Logs.LoggerNames != nil {
-			logger = logger.Named(s.Logs.LoggerNames[r.Host])
+		if s.Logs != nil {
+			logger = s.Logs.wrapLogger(logger, r.Host)
 		}
 
 		// get the values that will be used to log the error
@@ -149,7 +212,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if s.Errors != nil && len(s.Errors.Routes) > 0 {
 			// execute user-defined error handling route
-			err2 := s.executeCompositeRoute(w, r, s.Errors.Routes)
+			err2 := s.errorHandlerChain.ServeHTTP(w, r)
 			if err2 == nil {
 				// user's error route handled the error response
 				// successfully, so now just log the error
@@ -172,39 +235,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(errStatus)
 		}
 	}
-}
-
-// executeCompositeRoute compiles a composite route from routeList and executes
-// it using w and r. This function handles the sentinel ErrRehandle error value,
-// which reprocesses requests through the stack again. Any error value returned
-// from this function would be an actual error that needs to be handled.
-func (s *Server) executeCompositeRoute(w http.ResponseWriter, r *http.Request, routeList RouteList) error {
-	maxRehandles := 0
-	if s.MaxRehandles != nil {
-		maxRehandles = *s.MaxRehandles
-	}
-	var err error
-	for i := -1; i <= maxRehandles; i++ {
-		// we started the counter at -1 because we
-		// always want to run this at least once
-
-		// the purpose of rehandling is often to give
-		// matchers a chance to re-evaluate on the
-		// changed version of the request, so compile
-		// the handler stack anew in each iteration
-		stack := routeList.BuildCompositeRoute(r)
-		stack = s.wrapPrimaryRoute(stack)
-
-		// only loop if rehandling is required
-		err = stack.ServeHTTP(w, r)
-		if err != ErrRehandle {
-			break
-		}
-		if i >= maxRehandles-1 {
-			return fmt.Errorf("too many rehandles")
-		}
-	}
-	return err
 }
 
 // wrapPrimaryRoute wraps stack (a compiled middleware handler chain)
@@ -294,50 +324,20 @@ func (s *Server) hasTLSClientAuth() bool {
 	return false
 }
 
-// AutoHTTPSConfig is used to disable automatic HTTPS
-// or certain aspects of it for a specific server.
-type AutoHTTPSConfig struct {
-	// If true, automatic HTTPS will be entirely disabled.
-	Disabled bool `json:"disable,omitempty"`
-
-	// If true, only automatic HTTP->HTTPS redirects will
-	// be disabled.
-	DisableRedir bool `json:"disable_redirects,omitempty"`
-
-	// Hosts/domain names listed here will not be included
-	// in automatic HTTPS (they will not have certificates
-	// loaded nor redirects applied).
-	Skip []string `json:"skip,omitempty"`
-
-	// Hosts/domain names listed here will still be enabled
-	// for automatic HTTPS (unless in the Skip list), except
-	// that certificates will not be provisioned and managed
-	// for these names.
-	SkipCerts []string `json:"skip_certificates,omitempty"`
-
-	// By default, automatic HTTPS will obtain and renew
-	// certificates for qualifying hostnames. However, if
-	// a certificate with a matching SAN is already loaded
-	// into the cache, certificate management will not be
-	// enabled. To force automated certificate management
-	// regardless of loaded certificates, set this to true.
-	IgnoreLoadedCerts bool `json:"ignore_loaded_certificates,omitempty"`
-}
-
-// Skipped returns true if name is in skipSlice, which
-// should be one of the Skip* fields on ahc.
-func (ahc AutoHTTPSConfig) Skipped(name string, skipSlice []string) bool {
-	for _, n := range skipSlice {
-		if name == n {
-			return true
-		}
-	}
-	return false
-}
-
 // HTTPErrorConfig determines how to handle errors
 // from the HTTP handlers.
 type HTTPErrorConfig struct {
+	// The routes to evaluate after the primary handler
+	// chain returns an error. In an error route, extra
+	// placeholders are available:
+	//
+	// Placeholder | Description
+	// ------------|---------------
+	// `{http.error.status_code}` | The recommended HTTP status code
+	// `{http.error.status_text}` | The status text associated with the recommended status code
+	// `{http.error.message}`     | The error message
+	// `{http.error.trace}`       | The origin of the error
+	// `{http.error.id}`          | An identifier for this occurrence of the error
 	Routes RouteList `json:"routes,omitempty"`
 }
 
@@ -353,10 +353,10 @@ func (*HTTPErrorConfig) WithError(r *http.Request, err error) *http.Request {
 	r = r.WithContext(c)
 
 	// add error values to the replacer
-	repl := r.Context().Value(caddy.ReplacerCtxKey).(caddy.Replacer)
-	repl.Set("http.error", err.Error())
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	repl.Set("http.error", err)
 	if handlerErr, ok := err.(HandlerError); ok {
-		repl.Set("http.error.status_code", strconv.Itoa(handlerErr.StatusCode))
+		repl.Set("http.error.status_code", handlerErr.StatusCode)
 		repl.Set("http.error.status_text", http.StatusText(handlerErr.StatusCode))
 		repl.Set("http.error.trace", handlerErr.Trace)
 		repl.Set("http.error.id", handlerErr.ID)
@@ -367,7 +367,30 @@ func (*HTTPErrorConfig) WithError(r *http.Request, err error) *http.Request {
 
 // ServerLogConfig describes a server's logging configuration.
 type ServerLogConfig struct {
+	// The logger name for all logs emitted by this server unless
+	// the hostname is found in the LoggerNames (logger_names) map.
+	LoggerName string `json:"log_name,omitempty"`
+
+	// LoggerNames maps request hostnames to a custom logger name.
+	// For example, a mapping of "example.com" to "example" would
+	// cause access logs from requests with a Host of example.com
+	// to be emitted by a logger named "http.log.access.example".
 	LoggerNames map[string]string `json:"logger_names,omitempty"`
+}
+
+// wrapLogger wraps logger in a logger named according to user preferences for the given host.
+func (slc ServerLogConfig) wrapLogger(logger *zap.Logger, host string) *zap.Logger {
+	if loggerName := slc.getLoggerName(host); loggerName != "" {
+		return logger.Named(loggerName)
+	}
+	return logger
+}
+
+func (slc ServerLogConfig) getLoggerName(host string) string {
+	if loggerName, ok := slc.LoggerNames[host]; ok {
+		return loggerName
+	}
+	return slc.LoggerName
 }
 
 // errLogValues inspects err and returns the status code
@@ -423,11 +446,11 @@ func cloneURL(from, to *url.URL) {
 }
 
 const (
-	// CommonLogFormat is the common log format. https://en.wikipedia.org/wiki/Common_Log_Format
-	CommonLogFormat = `{http.request.remote.host} ` + CommonLogEmptyValue + ` {http.handlers.authentication.user.id} [{time.now.common_log}] "{http.request.orig_method} {http.request.orig_uri} {http.request.proto}" {http.response.status} {http.response.size}`
+	// commonLogFormat is the common log format. https://en.wikipedia.org/wiki/Common_Log_Format
+	commonLogFormat = `{http.request.remote.host} ` + commonLogEmptyValue + ` {http.authentication.user.id} [{time.now.common_log}] "{http.request.orig_method} {http.request.orig_uri} {http.request.proto}" {http.response.status} {http.response.size}`
 
-	// CommonLogEmptyValue is the common empty log value.
-	CommonLogEmptyValue = "-"
+	// commonLogEmptyValue is the common empty log value.
+	commonLogEmptyValue = "-"
 )
 
 // Context keys for HTTP request context values.
